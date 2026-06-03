@@ -6,36 +6,8 @@ inputs:
     required: true
   toolchain:
     description: "Cargo Toolchain"
-    required: true
-  target:
-    description: "Cargo Installation Target"
-    required: true
-  cargo-tool:
-    description: "Cargo Tool used for Build (for example, `cross`)"
-    required: true
-  expected-binary-architecture:
-    description: "Expected Binary Architecture"
     required: false
-    default: ""
-  generate-gleam-licences-html:
-    description: "Generate gleam-licences.html"
-    required: false
-    default: "false"
-  azure-tenant-id:
-    description: "Azure Tenant ID for Windows Code Signing"
-    required: false
-  azure-subscription-id:
-    description: "Azure Subscription ID for Windows Code Signing"
-    required: false
-  azure-client-id:
-    description: "Azure Client ID for Windows Code Signing"
-    required: false
-  azure-trusted-signing-account-name:
-    description: "Azure Trusted Signing Account Name for Windows Code Signing"
-    required: false
-  azure-certificate-profile-name:
-    description: "Azure Certificate Profile Name for Windows Code Signing"
-    required: false
+    default: "stable"
 
 outputs:
   files:
@@ -47,7 +19,6 @@ outputs:
       ${{ steps.build.outputs.archive }}.sigstore
       ${{ steps.build.outputs.archive }}.sbom.spdx.json
       ${{ steps.build.outputs.archive }}.sbom.cyclonedx.json
-      ${{ inputs.generate-gleam-licences-html == 'true' && 'gleam-licences.html' || '' }}
 
 runs:
   using: "composite"
@@ -56,8 +27,8 @@ runs:
       uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
       with:
         toolchain: ${{ inputs.toolchain }}
-        target: ${{ inputs.target }}
-        cache-key: v1-${{ inputs.target }}
+        target: wasm32-unknown-unknown
+        cache-key: v1-wasm32-unknown-unknown
 
     - name: Install Cargo SBoM
       shell: bash
@@ -65,152 +36,25 @@ runs:
       # keep it up-to-date.
       run: cargo install cargo-sbom@~0.9.1
 
-    - name: Build WASM release binary
-      if: ${{ inputs.target != 'wasm32-unknown-unknown' }}
-      uses: clechasseur/rs-cargo@319e211e9459c5e531afb6d157296765b441572e # v3.0.3
-      with:
-        command: build
-        args: --release --target ${{ inputs.target }}
-        tool: ${{ inputs.cargo-tool }}
-
     - name: Install wasm-pack
-      if: ${{ inputs.target == 'wasm32-unknown-unknown' }}
       shell: bash
       run: curl -sSL https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
 
     - name: Build WASM release binary
-      if: ${{ inputs.target == 'wasm32-unknown-unknown' }}
       shell: bash
       run: wasm-pack build --release --target web compiler-wasm
-
-    - name: Verify binary architecture
-      if: ${{ inputs.expected-binary-architecture }}
-      shell: bash
-      run: |
-        BINARY_PATH="target/${INPUTS_TARGET}/release/gleam"
-        if [[ "${INPUTS_TARGET}" == *"windows"* ]]; then
-          BINARY_PATH="${BINARY_PATH}.exe"
-        fi
-
-        if ! file -b "$BINARY_PATH" | grep -iq "${INPUTS_EXPECTED_BINARY_ARCHITECTURE}"; then
-          echo "error: Architecture mismatch"
-          echo "Expected architecture: '${INPUTS_EXPECTED_BINARY_ARCHITECTURE}'"
-          echo "Found binary type: '$(file -b "$BINARY_PATH")'"
-          exit 1
-        fi
-        echo "ok: Architecture match"
-      env:
-        INPUTS_TARGET: ${{ inputs.target }}
-        INPUTS_EXPECTED_BINARY_ARCHITECTURE: ${{ inputs.expected-binary-architecture }}
-
-    # We use Azure Trusted Signing to sign the Windows binaries.
-    # This is done to ensure that the binaries are trusted and can be
-    # verified by users and systems that require signed code.
-    #
-    # Why is this helpful?
-    # * It provides a way to verify the authenticity and integrity of the
-    #   binaries distributed by Gleam.
-    # * It helps prevent tampering with the binaries, ensuring that users
-    #   can trust the code they are running.
-    #
-    # For more information, see:
-    # * https://github.com/Azure/trusted-signing-action
-    # * https://azure.microsoft.com/en-us/products/trusted-signing
-    - name: Log in to Azure
-      if: ${{ contains(inputs.target, '-windows-') && inputs.azure-tenant-id && inputs.azure-subscription-id && inputs.azure-client-id && inputs.azure-trusted-signing-account-name && inputs.azure-certificate-profile-name }}
-      uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
-      with:
-        client-id: ${{ inputs.azure-client-id }}
-        tenant-id: ${{ inputs.azure-tenant-id }}
-        subscription-id: ${{ inputs.azure-subscription-id }}
-    - name: Windows Code Signing
-      if: ${{ contains(inputs.target, '-windows-') && inputs.azure-tenant-id && inputs.azure-subscription-id && inputs.azure-client-id && inputs.azure-trusted-signing-account-name && inputs.azure-certificate-profile-name }}
-      uses: azure/trusted-signing-action@0d74250c661747df006298d0fb49944c10f16e03 # v0.5.1
-      with:
-        endpoint: https://eus.codesigning.azure.net/
-        trusted-signing-account-name: ${{ inputs.azure-trusted-signing-account-name }}
-        certificate-profile-name: ${{ inputs.azure-certificate-profile-name }}
-        files: ${{ github.workspace }}\target\${{ inputs.target }}\release\gleam.exe
-        file-digest: SHA256
-        timestamp-rfc3161: http://timestamp.acs.microsoft.com
-        timestamp-digest: SHA256
 
     - name: Build archive
       id: build
       shell: bash
       run: |
-        case "$TARGET" in
-          *windows*)
-            ARCHIVE="gleam-$VERSION-$TARGET.zip"
-            cp "target/$TARGET/release/gleam.exe" "gleam.exe"
-            7z a "$ARCHIVE" "gleam.exe"
-            rm gleam.exe
-            ;;
-          wasm*)
-            ARCHIVE="gleam-$VERSION-browser.tar.gz"
-            tar -C compiler-wasm/pkg/ -czvf $ARCHIVE .
-            rm -rf compiler-wasm/pkg/
-            ;;
-          *)
-            ARCHIVE="gleam-$VERSION-$TARGET.tar.gz"
-            cp "target/$TARGET/release/gleam" "gleam"
-            tar -czvf "$ARCHIVE" "gleam"
-            rm gleam
-            ;;
-        esac
+        ARCHIVE="gleam-$VERSION-browser.tar.gz"
+        tar -C compiler-wasm/pkg/ -czvf "$ARCHIVE" .
+        rm -rf compiler-wasm/pkg/
 
         echo "archive=$ARCHIVE" >> $GITHUB_OUTPUT
       env:
-        TARGET: "${{ inputs.target }}"
         VERSION: "${{ inputs.version }}"
-
-    - name: Ensure binary successfully boots
-      if: ${{ inputs.expected-binary-architecture }}
-      shell: bash
-      run: |
-        case "$TARGET" in
-          *windows*)
-            7z x "$ARCHIVE"
-            ./gleam.exe --version
-            ;;
-          aarch64*)
-            echo "We cannot test an ARM binary on a AMD64 runner"
-            ;;
-          *)
-            tar -xvzf "$ARCHIVE"
-            ./gleam --version
-            ;;
-        esac
-      env:
-        TARGET: "${{ inputs.target }}"
-        ARCHIVE: "${{ steps.build.outputs.archive }}"
-
-    - name: Install Erlang
-      if: ${{ inputs.generate-gleam-licences-html == 'true' }}
-      uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
-      with:
-        otp-version: "29"
-        rebar3-version: "3"
-
-    - name: Generate licences HTML
-      if: ${{ inputs.generate-gleam-licences-html == 'true' }}
-      shell: bash
-      working-directory: licence-bundler
-      run: |
-        case "$TARGET" in
-          wasm*)
-            echo "error: cannot generate gleam-licences.html from a wasm build"
-            exit 1
-            ;;
-          *windows*)
-            ../target/"$TARGET"/release/gleam.exe run
-            ;;
-          *)
-            ../target/"$TARGET"/release/gleam run
-            ;;
-        esac
-      env:
-        TARGET: "${{ inputs.target }}"
 
     # By using `cargo-sbom``, we create two formats of Build SBoMs
     # (SPDX and CycloneDX) for the gleam build.
@@ -282,7 +126,7 @@ runs:
     - name: Upload artifact
       uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
       with:
-        name: release-${{ matrix.target }}
+        name: release-wasm32-unknown-unknown
         path: |
           ${{ steps.build.outputs.archive }}
           ${{ steps.build.outputs.archive }}.sha256
@@ -290,5 +134,4 @@ runs:
           ${{ steps.build.outputs.archive }}.sigstore
           ${{ steps.build.outputs.archive }}.sbom.spdx.json
           ${{ steps.build.outputs.archive }}.sbom.cyclonedx.json
-          ${{ inputs.generate-gleam-licences-html == 'true' && 'gleam-licences.html' || '' }}
         overwrite: true

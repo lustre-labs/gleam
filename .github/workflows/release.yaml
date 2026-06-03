@@ -19,20 +19,6 @@ jobs:
     permissions:
       id-token: write
       attestations: write
-    strategy:
-      matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
-          - x86_64-pc-windows-msvc
-          - aarch64-pc-windows-msvc
-        toolchain: [stable]
-        include:
-          - os: ubuntu-latest
-            target: wasm32-unknown-unknown
-            cargo-tool: wasm-pack
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -44,16 +30,7 @@ jobs:
         uses: "./.github/actions/build-release"
         with:
           version: ${{ github.ref_name }}
-          toolchain: ${{ matrix.toolchain }}
-          target: ${{ matrix.target }}
-          cargo-tool: ${{ matrix.cargo-tool }}
-          expected-binary-architecture: ${{ matrix.expected-binary-architecture }}
-          generate-gleam-licences-html: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-trusted-signing-account-name: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
-          azure-certificate-profile-name: ${{ vars.AZURE_CERTIFICATE_PROFILE_NAME }}
+          toolchain: stable
 
   create-release:
     name: create-release
