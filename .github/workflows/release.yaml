@@ -14,7 +14,7 @@ permissions:
 jobs:
   build-release:
     name: build-release
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     environment: release
     permissions:
       id-token: write
