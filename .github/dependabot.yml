@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2024 The Gleam contributors
+
 version: 2
 updates:
 - package-ecosystem: github-actions
-  directory: "/"
+  directories:
+  - "/"
+  - "/.github/actions/*"
   labels: []
   schedule:
     interval: monthly

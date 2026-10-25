@@ -1,13 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 use std::collections::HashMap;
 
 use camino::Utf8PathBuf;
 
+use crate::error::wrap;
 pub use codespan_reporting::diagnostic::{LabelStyle, Severity};
 use codespan_reporting::{diagnostic::Label as CodespanLabel, files::SimpleFiles};
 use ecow::EcoString;
+use src_span::SrcSpan;
 use termcolor::Buffer;
-
-use crate::{ast::SrcSpan, error::wrap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -65,7 +68,7 @@ impl Diagnostic {
         match &self.location {
             Some(location) => self.write_span(location, buffer),
             None => self.write_title(buffer),
-        };
+        }
 
         if !self.text.is_empty() {
             writeln!(buffer, "{}", self.text).expect("write text");

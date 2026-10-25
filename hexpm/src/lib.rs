@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
 mod proto;
 
 #[cfg(test)]
@@ -16,12 +19,11 @@ use regex::Regex;
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
-    fmt::Display,
     io::{BufReader, Read},
 };
 use thiserror::Error;
@@ -108,7 +110,7 @@ impl RequestBuilder {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Credentials {
     // Short lived credential from OAuth
     OAuthAccessToken(EcoString),
@@ -279,8 +281,6 @@ pub fn api_unretire_release_response(response: http::Response<Vec<u8>>) -> Resul
 /// the package registry.
 ///
 /// https://github.com/hexpm/specifications/blob/main/registry-v2.md
-///
-/// TODO: Where are the API docs for this?
 pub fn repository_v2_get_versions_request(
     credentials: Option<&Credentials>,
     config: &Config,
@@ -325,17 +325,17 @@ pub fn repository_v2_get_versions_body(
     let versions = Versions::decode(payload.as_slice())?
         .packages
         .into_iter()
-        .map(|n| {
-            let parse_version = |v: &str| {
-                let err = |_| ApiError::InvalidVersionFormat(v.to_string());
-                Version::parse(v).map_err(err)
+        .map(|package| {
+            let parse_version = |version: &str| {
+                let error = |_| ApiError::InvalidVersionFormat(version.to_string());
+                Version::parse(version).map_err(error)
             };
-            let versions = n
+            let versions = package
                 .versions
                 .iter()
-                .map(|v| parse_version(v.as_str()))
+                .map(|version| parse_version(version.as_str()))
                 .collect::<Result<Vec<Version>, ApiError>>()?;
-            Ok((n.name, versions))
+            Ok((package.name, versions))
         })
         .collect::<Result<HashMap<_, _>, ApiError>>()?;
 
@@ -368,6 +368,8 @@ pub fn repository_v2_get_package_response(
 
     match parts.status {
         StatusCode::OK => (),
+        StatusCode::TOO_MANY_REQUESTS => return Err(ApiError::RateLimited),
+        StatusCode::UNAUTHORIZED => return Err(unauthorised_response(&parts.headers)),
         StatusCode::FORBIDDEN => return Err(ApiError::NotFound),
         StatusCode::NOT_FOUND => return Err(ApiError::NotFound),
         status => {
@@ -393,15 +395,25 @@ pub fn repository_v2_package_parse_body(
         verify_payload(signed, public_key).map_err(|_| ApiError::IncorrectPayloadSignature)?;
 
     let package = proto::package::Package::decode(payload.as_slice())?;
-    let releases = package
-        .releases
-        .clone()
+    let proto::package::Package {
+        name,
+        repository,
+        advisories: proto_advisories,
+        releases: proto_releases,
+    } = package;
+
+    let advisories = proto_advisories
         .into_iter()
-        .map(proto_to_release)
+        .map(proto_to_security_advisory)
+        .collect::<Result<Vec<_>, _>>()?;
+    let releases = proto_releases
+        .into_iter()
+        .map(|release| proto_to_release(release, &advisories))
         .collect::<Result<Vec<_>, _>>()?;
     let package = Package {
-        name: package.name,
-        repository: package.repository,
+        name,
+        repository,
+        advisories,
         releases,
     };
 
@@ -409,7 +421,6 @@ pub fn repository_v2_package_parse_body(
 }
 
 /// Create a request to download a version of a package as a tarball
-/// TODO: Where are the API docs for this?
 pub fn repository_get_package_tarball_request(
     name: &str,
     version: &str,
@@ -436,6 +447,8 @@ pub fn repository_get_package_tarball_response(
     let (parts, body) = response.into_parts();
     match parts.status {
         StatusCode::OK => (),
+        StatusCode::TOO_MANY_REQUESTS => return Err(ApiError::RateLimited),
+        StatusCode::UNAUTHORIZED => return Err(unauthorised_response(&parts.headers)),
         StatusCode::FORBIDDEN => return Err(ApiError::NotFound),
         StatusCode::NOT_FOUND => return Err(ApiError::NotFound),
         status => {
@@ -592,8 +605,14 @@ pub fn api_revert_release_response(response: http::Response<Vec<u8>>) -> Result<
         StatusCode::TOO_MANY_REQUESTS => Err(ApiError::RateLimited),
         StatusCode::UNAUTHORIZED => Err(unauthorised_response(&parts.headers)),
         StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
+        StatusCode::UNPROCESSABLE_ENTITY if is_late_deletion(&body) => Err(ApiError::LateDeletion),
         status => Err(ApiError::unexpected_response(status, body)),
     }
+}
+
+fn is_late_deletion(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body)
+        .contains("can only delete a release up to one hour after publication")
 }
 
 /// See: https://github.com/hexpm/hex/blob/main/lib/mix/tasks/hex.owner.ex#L47
@@ -603,15 +622,6 @@ pub enum OwnerLevel {
     Maintainer,
     /// Has every package permission including the ability to change who owns the package
     Full,
-}
-
-impl Display for OwnerLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OwnerLevel::Maintainer => write!(f, "maintainer"),
-            OwnerLevel::Full => write!(f, "full"),
-        }
-    }
 }
 
 /// API Docs:
@@ -627,7 +637,7 @@ pub fn api_add_owner_request(
     config: &Config,
 ) -> http::Request<Vec<u8>> {
     let body = json!({
-        "level": level.to_string(),
+        "level": owner_level_to_json_string(level),
         "transfer": false,
     });
     let path = format!("packages/{package_name}/owners/{owner}");
@@ -636,6 +646,15 @@ pub fn api_add_owner_request(
         .write_credentials(credentials)
         .body(body.to_string().into_bytes())
         .expect("add_owner_request request")
+}
+
+/// Turns an `OwnerLevel` into a string that can be used with the json payload
+/// of requests to the Hex API expecting an owner level.
+fn owner_level_to_json_string(level: OwnerLevel) -> &'static str {
+    match level {
+        OwnerLevel::Maintainer => "maintainer",
+        OwnerLevel::Full => "full",
+    }
 }
 
 pub fn api_add_owner_response(response: http::Response<Vec<u8>>) -> Result<(), ApiError> {
@@ -662,7 +681,7 @@ pub fn api_transfer_owner_request(
     config: &Config,
 ) -> http::Request<Vec<u8>> {
     let body = json!({
-        "level": OwnerLevel::Full.to_string(),
+        "level": owner_level_to_json_string(OwnerLevel::Full),
         "transfer": true,
     });
     let path = format!("packages/{package_name}/owners/{owner}");
@@ -724,7 +743,7 @@ pub enum ApiError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    #[error("The rate limit for the Hex API has been exceeded for this IP")]
+    #[error("The rate limit for the Hex API has been exceeded")]
     RateLimited,
 
     #[error("Invalid authentication credentials")]
@@ -762,6 +781,9 @@ pub enum ApiError {
 
     #[error("Can only modify a release up to one hour after publication")]
     LateModification,
+
+    #[error("Can only delete a release up to one hour after publication")]
+    LateDeletion,
 
     #[error("The oauth request wasn't approved in time")]
     OAuthTimeout,
@@ -842,48 +864,107 @@ fn proto_to_retirement_reason(reason: proto::package::RetirementReason) -> Retir
     }
 }
 
-fn proto_to_dep(dep: proto::package::Dependency) -> Result<(String, Dependency), ApiError> {
-    let app = dep.app;
-    let repository = dep.repository;
-    let requirement = Range::new(dep.requirement.clone())
-        .map_err(|_| ApiError::InvalidVersionFormat(dep.requirement))?;
+fn proto_to_dependency(
+    dependency: proto::package::Dependency,
+) -> Result<(String, Dependency), ApiError> {
+    let proto::package::Dependency {
+        app,
+        package,
+        requirement,
+        optional,
+        repository,
+    } = dependency;
+    let requirement =
+        Range::new(requirement.clone()).map_err(|_| ApiError::InvalidVersionFormat(requirement))?;
     Ok((
-        dep.package,
+        package,
         Dependency {
             requirement,
-            optional: dep.optional.is_some(),
+            optional: optional.is_some(),
             app,
             repository,
         },
     ))
 }
 
-fn proto_to_release(release: proto::package::Release) -> Result<Release<()>, ApiError> {
+fn proto_to_release(
+    release: proto::package::Release,
+    package_advisories: &[SecurityAdvisory],
+) -> Result<Release<()>, ApiError> {
     let dependencies = release
         .dependencies
-        .clone()
         .into_iter()
-        .map(proto_to_dep)
+        .map(proto_to_dependency)
         .collect::<Result<HashMap<_, _>, _>>()?;
-    let version = Version::try_from(release.version.as_str())
-        .expect("Failed to parse version format from Hex");
+    let version =
+        Version::try_from(release.version.as_str()).expect("valid version format from Hex");
+    let security_advisories = release
+        .advisory_indexes
+        .iter()
+        .map(|index| package_advisories[*index as usize].clone())
+        .collect();
     Ok(Release {
         version,
         outer_checksum: release.outer_checksum.unwrap_or_default(),
         retirement_status: proto_to_retirement_status(release.retired),
         requirements: dependencies,
+        security_advisories,
         meta: (),
     })
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Package {
-    pub name: String,
-    pub repository: String,
-    pub releases: Vec<Release<()>>,
+fn proto_to_security_advisory(
+    advisory: proto::package::SecurityAdvisory,
+) -> Result<SecurityAdvisory, ApiError> {
+    let proto::package::SecurityAdvisory {
+        id,
+        summary,
+        aliases,
+        api_url,
+        cvss_score,
+        html_url,
+        severity,
+    } = advisory;
+    // We use this instead of just `SecurityAdvisory::severity()` to save `None`
+    // state, since otherwise it will be lost.
+    let cvss_rating = severity
+        .and_then(|severity| severity.try_into().ok())
+        .map(proto_to_advisory_severity);
+    Ok(SecurityAdvisory {
+        id,
+        summary,
+        html_url,
+        cvss_rating,
+        cvss_score,
+        api_url,
+        aliases,
+    })
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, serde::Deserialize)]
+fn proto_to_advisory_severity(severity: proto::package::AdvisorySeverity) -> AdvisorySeverity {
+    use proto::package::AdvisorySeverity::*;
+    match severity {
+        SeverityNone => AdvisorySeverity::None,
+        SeverityLow => AdvisorySeverity::Low,
+        SeverityMedium => AdvisorySeverity::Medium,
+        SeverityHigh => AdvisorySeverity::High,
+        SeverityCritical => AdvisorySeverity::Critical,
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct Package {
+    /// Name of package
+    pub name: String,
+    /// Name of repository
+    pub repository: String,
+    /// All releases of the package
+    pub releases: Vec<Release<()>>,
+    /// All security advisories affecting any release of the package
+    pub advisories: Vec<SecurityAdvisory>,
+}
+
+#[derive(Debug, PartialEq, Clone, serde::Deserialize)]
 pub struct Release<Meta> {
     /// Release version
     pub version: Version,
@@ -896,6 +977,9 @@ pub struct Release<Meta> {
     /// required when encoding but optional when decoding
     #[serde(alias = "checksum", deserialize_with = "deserialize_checksum")]
     pub outer_checksum: Vec<u8>,
+    /// Security advisories affecting this release of the package
+    #[serde(default)]
+    pub security_advisories: Vec<SecurityAdvisory>,
     /// This is not present in all API endpoints so may be absent sometimes.
     pub meta: Meta,
 }
@@ -916,8 +1000,41 @@ impl<Meta> Release<Meta> {
 
 #[derive(Debug, PartialEq, Eq, Clone, serde::Deserialize)]
 pub struct ReleaseMeta {
+    #[serde(deserialize_with = "deserialize_package_name")]
     pub app: String,
     pub build_tools: Vec<String>,
+}
+
+static PACKAGE_NAME_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new("^[a-z][a-z0-9_]*$").expect("name regex"));
+
+fn deserialize_package_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if PACKAGE_NAME_PATTERN.is_match(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom("not a valid package name"))
+    }
+}
+
+fn deserialise_optional_package_name<'de, D>(deserialiser: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<&str> = Deserialize::deserialize(deserialiser)?;
+    match value {
+        Some(name) => {
+            if PACKAGE_NAME_PATTERN.is_match(name) {
+                Ok(Some(name.into()))
+            } else {
+                Err(serde::de::Error::custom("not a valid package name"))
+            }
+        }
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, serde::Deserialize)]
@@ -964,6 +1081,63 @@ impl RetirementReason {
     }
 }
 
+#[derive(Debug, PartialEq, Clone, serde::Deserialize)]
+pub struct SecurityAdvisory {
+    /// Advisory identifier (e.g. GHSA-xxxx-xxxx-xxxx or CVE-xxxx-xxxxx)
+    pub id: String,
+    /// Short description of the advisory
+    pub summary: String,
+    /// OSV web URL for the advisory
+    pub html_url: String,
+    /// Severity of the advisory
+    pub cvss_rating: Option<AdvisorySeverity>,
+    /// CVSS score (0.0–10.0)
+    pub cvss_score: Option<f32>,
+    /// OSV API URL for the advisory
+    pub api_url: String,
+    /// Other identifiers for the same vulnerability (e.g. a CVE id when the
+    /// primary id is a GHSA id, or vice versa).
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum AdvisorySeverity {
+    None,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl<'de> serde::Deserialize<'de> for AdvisorySeverity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s: &str = serde::de::Deserialize::deserialize(deserializer)?;
+        match s {
+            "none" => Ok(AdvisorySeverity::None),
+            "low" => Ok(AdvisorySeverity::Low),
+            "medium" => Ok(AdvisorySeverity::Medium),
+            "high" => Ok(AdvisorySeverity::High),
+            "critical" => Ok(AdvisorySeverity::Critical),
+            _ => Err(serde::de::Error::custom("unknown advisory severity type")),
+        }
+    }
+}
+
+impl AdvisorySeverity {
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            AdvisorySeverity::None => "none",
+            AdvisorySeverity::Low => "low",
+            AdvisorySeverity::Medium => "medium",
+            AdvisorySeverity::High => "high",
+            AdvisorySeverity::Critical => "critical",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, serde::Deserialize)]
 pub struct Dependency {
     /// Version requirement of dependency
@@ -971,6 +1145,7 @@ pub struct Dependency {
     /// If true the package is optional and does not need to be resolved
     /// unless another package has specified it as a non-optional dependency.
     pub optional: bool,
+    #[serde(deserialize_with = "deserialise_optional_package_name")]
     /// If set is the OTP application name of the dependency, if not set the
     /// application name is the same as the package name
     pub app: Option<String>,
@@ -980,10 +1155,10 @@ pub struct Dependency {
 
 static USER_AGENT: &str = concat!("Gleam v", env!("CARGO_PKG_VERSION"));
 
-fn validate_package_and_version(package: &str, version: &str) -> Result<(), ApiError> {
-    static PACKAGE_PATTERN: OnceLock<Regex> = OnceLock::new();
-    static VERSION_PATTERN: OnceLock<Regex> = OnceLock::new();
+static PACKAGE_PATTERN: OnceLock<Regex> = OnceLock::new();
+static VERSION_PATTERN: OnceLock<Regex> = OnceLock::new();
 
+fn validate_package_and_version(package: &str, version: &str) -> Result<(), ApiError> {
     let package_pattern = PACKAGE_PATTERN.get_or_init(|| Regex::new(r"^[a-z]\w*$").unwrap());
     let version_pattern =
         VERSION_PATTERN.get_or_init(|| Regex::new(r"^[a-zA-Z-0-9\._-]+$").unwrap());

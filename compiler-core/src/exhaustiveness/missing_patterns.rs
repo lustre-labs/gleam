@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2023 The Gleam contributors
+
 use super::{CompileCaseResult, Decision, FallbackCheck, RuntimeCheck, Variable, printer::Printer};
 use crate::type_::environment::Environment;
 use ecow::EcoString;
@@ -124,19 +127,19 @@ impl<'a, 'env> MissingPatternsGenerator<'a, 'env> {
                     self.add_missing_patterns_after_check(var, check, body);
                 }
 
-                match fallback_check.as_ref() {
+                match fallback_check {
                     FallbackCheck::InfiniteCatchAll => {
                         self.add_missing_patterns(fallback);
                     }
                     FallbackCheck::RuntimeCheck { check } => {
-                        self.add_missing_patterns_after_check(var, check, fallback)
+                        self.add_missing_patterns_after_check(var, check, fallback);
                     }
                     FallbackCheck::CatchAll { ignored_checks } => {
                         for check in ignored_checks {
                             self.add_missing_patterns_after_check(var, check, fallback);
                         }
                     }
-                };
+                }
             }
         }
     }

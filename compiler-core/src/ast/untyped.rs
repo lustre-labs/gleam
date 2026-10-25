@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 use vec1::Vec1;
 
 use crate::parse::LiteralFloatValue;
@@ -67,7 +70,7 @@ pub enum UntypedExpr {
         right: Box<Self>,
     },
 
-    PipeLine {
+    Pipeline {
         expressions: Vec1<Self>,
     },
 
@@ -157,7 +160,7 @@ pub enum UntypedExpr {
 impl UntypedExpr {
     pub fn location(&self) -> SrcSpan {
         match self {
-            Self::PipeLine { expressions, .. } => expressions
+            Self::Pipeline { expressions, .. } => expressions
                 .first()
                 .location()
                 .merge(&expressions.last().location()),
@@ -188,7 +191,7 @@ impl UntypedExpr {
     pub fn start_byte_index(&self) -> u32 {
         match self {
             Self::Block { location, .. } => location.start,
-            Self::PipeLine { expressions, .. } => expressions.first().start_byte_index(),
+            Self::Pipeline { expressions, .. } => expressions.first().start_byte_index(),
             Self::Int { .. }
             | Self::Float { .. }
             | Self::String { .. }
@@ -214,7 +217,7 @@ impl UntypedExpr {
     pub fn bin_op_precedence(&self) -> u8 {
         match self {
             Self::BinOp { operator, .. } => operator.precedence(),
-            Self::PipeLine { .. } => 5,
+            Self::Pipeline { .. } => 5,
             Self::Int { .. }
             | Self::Float { .. }
             | Self::String { .. }
@@ -263,7 +266,7 @@ impl UntypedExpr {
             | UntypedExpr::List { .. }
             | UntypedExpr::Call { .. }
             | UntypedExpr::BinOp { .. }
-            | UntypedExpr::PipeLine { .. }
+            | UntypedExpr::Pipeline { .. }
             | UntypedExpr::Case { .. }
             | UntypedExpr::Tuple { .. }
             | UntypedExpr::TupleIndex { .. }
@@ -294,7 +297,7 @@ impl UntypedExpr {
 
     #[must_use]
     pub fn is_pipeline(&self) -> bool {
-        matches!(self, Self::PipeLine { .. })
+        matches!(self, Self::Pipeline { .. })
     }
 
     #[must_use]

@@ -1,3 +1,8 @@
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  SPDX-FileCopyrightText: 2024 The Gleam contributors
+-->
+
 # Contributing to Gleam
 
 Thanks for contributing to Gleam!
@@ -43,14 +48,25 @@ Code changes to Gleam are welcomed via the process below.
 5. Once the changes have been approved the code will be rebased into the
    `main` branch.
 
+We do not accept contributions from AI agents.
+
+
+## Communication with contributions
+
+Open source software development is a social exercise as much as a technical
+one. Bug reports, pull request descriptions, and comments must be written by a
+human, not by AI. We want your knowledge and opinions in your tone of voice; we
+do not want generated text or AI summaries.
+
+You may use software to help you with your English spelling and grammar. If
+your message is translated into English from another language please disclose
+that in your message, so that we understand.
+
+
 ## Local development
 
 To run the compiler tests. This will require a recent stable version of Rust,
 Erlang, Elixir, NodeJS, Deno, and Bun to be installed.
-
-If you are using the Nix package manager, there's a [gleam-nix flake](https://github.com/vic/gleam-nix)
-you can use for running any Gleam version or quickly obtaining a development
-environment for Gleam.
 
 ```sh
 cargo test

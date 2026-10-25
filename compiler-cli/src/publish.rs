@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2021 The Gleam contributors
+
 use camino::{Utf8Path, Utf8PathBuf};
 use ecow::EcoString;
 use flate2::{Compression, write::GzEncoder};
@@ -5,10 +8,10 @@ use gleam_core::{
     Error, Result,
     analyse::TargetSupport,
     ast::{CallArg, Statement, TypedExpr, TypedFunction},
-    build::{Codegen, Compile, Mode, Options, Package, Target},
+    build::{Codegen, Compile, ErlangOutput, Mode, Options, Package, Target},
     config::{GleamVersion, PackageConfig, SpdxLicense},
     docs::{Dependency, DependencyKind, DocContext},
-    error::{InvalidReadmeReason, SmallVersion, wrap},
+    error::{FileIoCause, InvalidReadmeReason, SmallVersion, wrap},
     hex,
     manifest::ManifestPackageSource,
     paths::{self, ProjectPaths},
@@ -111,7 +114,7 @@ pub fn command(paths: &ProjectPaths, replace: bool, i_am_sure: bool) -> Result<(
     cli::print_published("package and documentation");
     println!(
         "\nView your package at https://hex.pm/packages/{}",
-        &config.name
+        config.name
     );
 
     // Prompt the user to make a git tag if they have not.
@@ -127,13 +130,13 @@ pub fn command(paths: &ProjectPaths, replace: bool, i_am_sure: bool) -> Result<(
         if !tag_exists {
             println!(
                 "
-    Please push a git tag for this release so source code links in the
-    HTML documentation will work:
+Please push a git tag for this release so source code links in the
+HTML documentation will work:
 
-        git tag {tag_name}
-        git push origin {tag_name}
-    "
-            )
+    git tag {tag_name}
+    git push origin {tag_name}
+"
+            );
         }
     }
     Ok(())
@@ -151,7 +154,8 @@ fn check_for_invalid_readme(config: &PackageConfig, paths: &ProjectPaths) -> Res
 
     let project_readme = match fs::read(paths.readme()) {
         Err(Error::FileIo {
-            err: Some(message), ..
+            cause: FileIoCause::Other(message),
+            ..
         }) if message.contains("No such file or directory") => {
             return Err(Error::CannotPublishWithInvalidReadme {
                 reason: InvalidReadmeReason::Missing,
@@ -259,7 +263,7 @@ fn is_default_main(main: &TypedFunction, package_name: &EcoString) -> bool {
                     value: TypedExpr::String { value, .. },
                     ..
                 }) => {
-                    let default_argument = format!("Hello from {}!", &package_name);
+                    let default_argument = format!("Hello from {}!", package_name);
                     value == &default_argument
                 }
                 _ => false,
@@ -336,7 +340,7 @@ fn check_repo_url(config: &PackageConfig, i_am_sure: bool) -> Result<bool, Error
     println!(
         "The repository configuration in your `gleam.toml` file does not appear to be
 valid, {} returned status {}",
-        &url,
+        url,
         response.status()
     );
     let should_publish = i_am_sure || cli::confirm("\nDo you wish to continue?")?;
@@ -389,7 +393,7 @@ the maintainers listed on https://hex.pm/.
 
 struct Tarball {
     compile_result: Package,
-    cached_modules: im::HashMap<EcoString, type_::ModuleInterface>,
+    cached_modules: imbl::HashMap<EcoString, type_::ModuleInterface>,
     data: Vec<u8>,
     src_files_added: Vec<Utf8PathBuf>,
     generated_files_added: Vec<(Utf8PathBuf, String)>,
@@ -450,6 +454,7 @@ fn do_build_hex_tarball(paths: &ProjectPaths, config: &mut PackageConfig) -> Res
             codegen: Codegen::All,
             compile: Compile::All,
             no_print_progress: false,
+            erlang_output: ErlangOutput::Textual,
         },
         manifest,
     )?;
@@ -720,7 +725,7 @@ fn generated_erlang_files(
             continue;
         }
 
-        let name = module.compiled_erlang_path();
+        let name = module.compiled_textual_erlang_path();
         files.push((tar_src.join(&name), fs::read(build.join(name))?));
     }
 
@@ -733,8 +738,8 @@ fn generated_erlang_files(
     }
 
     // src/package.app.src file
-    let app = format!("{}.app", &package.config.name);
-    let appsrc = format!("{}.src", &app);
+    let app = format!("{}.app", package.config.name);
+    let appsrc = format!("{}.src", app);
     files.push((tar_src.join(appsrc), fs::read(ebin.join(app))?));
 
     Ok(files)
@@ -754,7 +759,7 @@ where
     header.set_cksum();
     tarball
         .append_data(&mut header, path, data)
-        .map_err(|e| Error::add_tar(path, e))
+        .map_err(|error| Error::add_tar(path, error))
 }
 
 fn add_to_tar_from_file_system<P, W>(
@@ -770,14 +775,15 @@ where
     tracing::info!(file=?&path, "Adding file system file to tarball");
 
     let path = fs::canonicalise(path)?;
+    let root = fs::canonicalise(paths.root())?;
 
-    let Ok(path) = path.strip_prefix(paths.root()) else {
+    let Ok(relative_path) = path.strip_prefix(&root) else {
         return Err(Error::TarPathOutsideOfProjectRoot { path });
     };
 
     tarball
-        .append_path(path)
-        .map_err(|e| Error::add_tar(path, e))
+        .append_path_with_name(&path, relative_path)
+        .map_err(|error| Error::add_tar(relative_path, error))
 }
 
 #[test]
@@ -785,7 +791,9 @@ fn add_to_tar_symlink_rejection_test() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let path = std::fs::canonicalize(tmp_dir.path()).unwrap();
     let path = Utf8Path::from_path(&path).expect("Non Utf-8 Path");
-    let paths = ProjectPaths::new(path.join("package"));
+    let root = path.join("package");
+    fs::mkdir(&root).expect("Create directory");
+    let paths = ProjectPaths::new(root);
     let mut contents_tar_gz = Vec::new();
     let mut tarball = tar::Builder::new(&mut contents_tar_gz);
 
@@ -797,6 +805,45 @@ fn add_to_tar_symlink_rejection_test() {
         Error::TarPathOutsideOfProjectRoot { path } => assert_eq!(path, outside_path),
         other => panic!("Unexpected error {other:?}"),
     }
+}
+
+#[test]
+fn add_to_tar_accepts_file_inside_project_test() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let root = Utf8Path::from_path(tmp_dir.path())
+        .expect("Non Utf-8 Path")
+        .join("package");
+    let paths = ProjectPaths::new(root.clone());
+
+    let source_path = root.join("src").join("package.gleam");
+    fs::write(&source_path, "pub fn main() { 1 }").expect("Write file");
+
+    let mut contents_tar = Vec::new();
+    let mut tarball = tar::Builder::new(&mut contents_tar);
+    add_to_tar_from_file_system(&mut tarball, &paths, &source_path).unwrap();
+    tarball.finish().unwrap();
+    drop(tarball);
+
+    let mut archive = tar::Archive::new(contents_tar.as_slice());
+    let entries = archive
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let path = Utf8PathBuf::from_path_buf(entry.path().unwrap().into_owned())
+                .expect("Non UTF-8 Path");
+            let contents = std::io::read_to_string(entry).unwrap();
+            (path, contents)
+        })
+        .collect_vec();
+
+    assert_eq!(
+        entries,
+        vec![(
+            Utf8PathBuf::from("src/package.gleam"),
+            "pub fn main() { 1 }".into()
+        )]
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -824,7 +871,13 @@ impl ReleaseMetadata<'_> {
             )
         }
         fn file(name: impl AsRef<Utf8Path>) -> String {
-            format!("\n  <<\"{name}\"/utf8>>", name = name.as_ref())
+            // Package paths must use `/` separators regardless of the platform
+            // the package was built on. Erlang treats `\` as an escape
+            // character inside a string literal, so native Windows separators
+            // would either silently corrupt the paths or stop other tools from
+            // parsing the metadata at all.
+            let name = name.as_ref().components().map(|c| c.as_str()).join("/");
+            format!("\n  <<\"{name}\"/utf8>>")
         }
 
         format!(
@@ -903,19 +956,20 @@ fn release_metadata_as_erlang() {
     let github = "https://github.com/lpil/myapp".parse().unwrap();
     let req1 = Range::new("~> 1.2.3 or >= 5.0.0".into()).unwrap();
     let req2 = Range::new("~> 1.2".into()).unwrap();
+    let src = Utf8Path::new("src");
     let meta = ReleaseMetadata {
         name: "myapp",
         version: &version,
         description: "description goes here 🌈",
         source_files: &[
             Utf8PathBuf::from("gleam.toml"),
-            Utf8PathBuf::from("src/thingy.gleam"),
-            Utf8PathBuf::from("src/whatever.gleam"),
+            src.join("thingy.gleam"),
+            src.join("whatever.gleam"),
         ],
         generated_files: &[
-            (Utf8PathBuf::from("src/myapp.app"), "".into()),
-            (Utf8PathBuf::from("src/thingy.erl"), "".into()),
-            (Utf8PathBuf::from("src/whatever.erl"), "".into()),
+            (src.join("myapp.app"), "".into()),
+            (src.join("thingy.erl"), "".into()),
+            (src.join("whatever.erl"), "".into()),
         ],
         licenses: &licences,
         links: vec![("homepage", homepage), ("github", github)],
@@ -984,7 +1038,7 @@ fn release_metadata_as_erlang() {
 fn prevent_publish_local_dependency() {
     let config = PackageConfig {
         dependencies: [("provided".into(), Requirement::path("./path/to/package"))].into(),
-        ..Default::default()
+        ..PackageConfig::default()
     };
     assert_eq!(
         metadata_config(&config, &HashMap::new(), &[], &[]),
@@ -1002,7 +1056,7 @@ fn prevent_publish_git_dependency() {
             Requirement::git("https://github.com/gleam-lang/gleam.git", "da6e917"),
         )]
         .into(),
-        ..Default::default()
+        ..PackageConfig::default()
     };
     assert_eq!(
         metadata_config(&config, &HashMap::new(), &[], &[]),

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2023 The Gleam contributors
+
 mod action;
 mod compilation;
 mod completion;
@@ -29,14 +32,14 @@ use gleam_core::{
     build::Origin,
     config::PackageConfig,
     io::{
-        BeamCompiler, Command, CommandExecutor, FileSystemReader, FileSystemWriter, ReadDir,
+        BeamCompilerIO, Command, CommandExecutor, FileSystemReader, FileSystemWriter, ReadDir,
         WrappedReader, memory::InMemoryFileSystem,
     },
-    line_numbers::LineNumbers,
     manifest::{Base16Checksum, Manifest, ManifestPackage, ManifestPackageSource},
     paths::ProjectPaths,
     requirement::Requirement,
 };
+use src_span::LineNumbers;
 
 use super::{
     DownloadDependencies, LockGuard, Locker, MakeLocker, engine::LanguageServerEngine,
@@ -66,10 +69,10 @@ struct LanguageServerTestIO {
 
 fn default_manifest_package() -> ManifestPackage {
     ManifestPackage {
-        name: Default::default(),
-        build_tools: Default::default(),
-        otp_app: Default::default(),
-        requirements: Default::default(),
+        name: EcoString::new(),
+        build_tools: vec![],
+        otp_app: None,
+        requirements: vec![],
         version: Version::new(1, 0, 0),
         source: ManifestPackageSource::Hex {
             outer_checksum: Base16Checksum(vec![]),
@@ -80,8 +83,8 @@ fn default_manifest_package() -> ManifestPackage {
 impl LanguageServerTestIO {
     fn new() -> Self {
         Self {
-            io: Default::default(),
-            actions: Default::default(),
+            io: InMemoryFileSystem::default(),
+            actions: Arc::new(Mutex::new(vec![])),
             paths: ProjectPaths::at_filesystem_root(),
             manifest: Manifest {
                 requirements: HashMap::new(),
@@ -253,14 +256,14 @@ impl CommandExecutor for LanguageServerTestIO {
     }
 }
 
-impl BeamCompiler for LanguageServerTestIO {
+impl BeamCompilerIO for LanguageServerTestIO {
     fn compile_beam(
         &self,
         out: &Utf8Path,
         lib: &Utf8Path,
         modules: &HashSet<Utf8PathBuf>,
         stdio: gleam_core::io::Stdio,
-    ) -> Result<Vec<String>> {
+    ) -> Result<()> {
         panic!("compile_beam({out:?}, {lib:?}, {modules:?}, {stdio:?}) is not implemented")
     }
 }
@@ -337,9 +340,11 @@ fn add_package_from_manifest<B>(
             ManifestPackageSource::Git {
                 ref repo,
                 ref commit,
+                ..
             } => Requirement::Git {
                 git: repo.clone(),
                 ref_: commit.clone(),
+                path: None,
             },
         },
     );
@@ -362,9 +367,11 @@ fn add_dev_package_from_manifest<B>(
             ManifestPackageSource::Git {
                 ref repo,
                 ref commit,
+                ..
             } => Requirement::Git {
                 git: repo.clone(),
                 ref_: commit.clone(),
+                path: None,
             },
         },
     );
@@ -805,6 +812,20 @@ impl<'a> TestProject<'a> {
             .expect("Module doesn't exist");
 
         executor(&mut engine, params, code.into())
+    }
+
+    /// Run a test in a project without a specific position (for workspace-wide
+    /// actions).
+    pub fn run<T>(
+        &self,
+        executor: impl FnOnce(
+            &mut LanguageServerEngine<LanguageServerTestIO, LanguageServerTestIO>,
+        ) -> T,
+    ) -> T {
+        // Use a throwaway position and ignore it
+        let (mut engine, _) = self.positioned_with_io(Position::default());
+
+        executor(&mut engine)
     }
 }
 

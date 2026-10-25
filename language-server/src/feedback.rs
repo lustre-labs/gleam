@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2023 The Gleam contributors
+
 use gleam_core::{Error, Warning, diagnostic::Diagnostic};
 use std::collections::{HashMap, HashSet};
 
@@ -25,7 +28,7 @@ impl Feedback {
     /// No feedback at all.
     ///
     pub fn none() -> Feedback {
-        Default::default()
+        Feedback::default()
     }
 
     /// Add all the content of another feedback to this feedback.
@@ -210,11 +213,11 @@ mod tests {
 
     use super::*;
     use gleam_core::{
-        ast::SrcSpan,
         diagnostic::Level,
         parse::error::{ParseError, ParseErrorType},
         type_,
     };
+    use src_span::SrcSpan;
 
     #[test]
     fn feedback() {

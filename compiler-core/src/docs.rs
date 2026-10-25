@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 mod printer;
 mod source_links;
 #[cfg(test)]
@@ -13,6 +16,7 @@ use crate::{
     build::{Module, Package},
     config::{DocsPage, PackageConfig},
     docs::source_links::SourceLinker,
+    error::Error,
     io::{Content, FileSystemReader, OutputFile},
     package_interface::PackageInterface,
     paths::ProjectPaths,
@@ -66,7 +70,7 @@ pub fn generate_html<IO: FileSystemReader>(
     paths: &ProjectPaths,
     config: DocumentationConfig<'_>,
     fs: IO,
-) -> Vec<OutputFile> {
+) -> Result<Vec<OutputFile>, Error> {
     let DocumentationConfig {
         package_config: config,
         dependencies,
@@ -122,7 +126,7 @@ pub fn generate_html<IO: FileSystemReader>(
             .chain(repo_link)
             .chain([Link {
                 name: "Hex".into(),
-                path: format!("https://hex.pm/packages/{0}", config.name).to_string(),
+                path: format!("https://hex.pm/packages/{0}", config.name),
             }])
             .collect(),
         DocContext::Build => doc_links.chain(repo_link).collect(),
@@ -144,9 +148,24 @@ pub fn generate_html<IO: FileSystemReader>(
         .sorted()
         .collect();
 
+    let root = fs.canonicalise(paths.root())?;
+
     // Generate user-supplied (or README) pages
     for page in docs_pages {
-        let content = fs.read(&page.source).unwrap_or_default();
+        let path = paths.root().join(&page.source);
+        // Files are not permitted to be read from outside the project root.
+        let content = match fs.canonicalise(path.as_path()) {
+            Ok(path) => {
+                if path.starts_with(root.as_path()) {
+                    fs.read(&path)?
+                } else {
+                    return Err(Error::DocumentationPageOutsidePackage {
+                        path: path.to_path_buf(),
+                    });
+                }
+            }
+            Err(_) => "".into(),
+        };
         let rendered_content = render_markdown(&content, MarkdownSource::Standalone);
         let unnest = page_unnest(page.path.as_str());
 
@@ -188,7 +207,7 @@ pub fn generate_html<IO: FileSystemReader>(
             &config.name,
             page.path.as_str(),
             content,
-        ))
+        ));
     }
 
     // Generate module documentation pages
@@ -335,7 +354,7 @@ pub fn generate_html<IO: FileSystemReader>(
 
     files.push(OutputFile {
         path: Utf8PathBuf::from("search-data.json"),
-        content: Content::Text(search_data_json.to_string()),
+        content: Content::Text(search_data_json),
     });
 
     files.push(OutputFile {
@@ -426,7 +445,7 @@ pub fn generate_html<IO: FileSystemReader>(
         ),
     });
 
-    files
+    Ok(files)
 }
 
 fn search_item_for_page(package: &str, path: &str, content: String) -> SearchItem {
@@ -500,15 +519,20 @@ fn search_item_for_module(module: &Module) -> SearchItem {
 pub fn generate_json_package_interface(
     path: Utf8PathBuf,
     package: &Package,
-    cached_modules: &im::HashMap<EcoString, type_::ModuleInterface>,
+    cached_modules: &imbl::HashMap<EcoString, type_::ModuleInterface>,
 ) -> OutputFile {
     OutputFile {
         path,
-        content: Content::Text(
-            serde_json::to_string(&PackageInterface::from_package(package, cached_modules))
-                .expect("JSON module interface serialisation"),
-        ),
+        content: Content::Text(package_interface(package, cached_modules)),
     }
+}
+
+pub fn package_interface(
+    package: &Package,
+    cached_modules: &imbl::HashMap<EcoString, type_::ModuleInterface>,
+) -> String {
+    serde_json::to_string_pretty(&PackageInterface::from_package(package, cached_modules))
+        .expect("JSON module interface serialisation")
 }
 
 pub fn generate_json_package_information(path: Utf8PathBuf, config: PackageConfig) -> OutputFile {
@@ -518,7 +542,7 @@ pub fn generate_json_package_information(path: Utf8PathBuf, config: PackageConfi
     }
 }
 
-fn package_information_as_json(config: PackageConfig) -> String {
+pub fn package_information_as_json(config: PackageConfig) -> String {
     let info = PackageInformation {
         package_config: config,
     };

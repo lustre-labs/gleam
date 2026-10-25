@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2021 The Gleam contributors
+
 use crate::{
     analyse::TargetSupport,
     build::{Origin, Target},
     config::PackageConfig,
-    inline,
     javascript::*,
     uid::UniqueIdGenerator,
     warning::{TypeWarningEmitter, WarningEmitter},
@@ -23,7 +25,6 @@ mod echo;
 mod externals;
 mod functions;
 mod generics;
-mod inlining;
 mod lists;
 mod modules;
 mod numbers;
@@ -37,6 +38,7 @@ mod strings;
 mod todo;
 mod tuples;
 mod type_alias;
+mod typescript;
 mod use_;
 
 pub static CURRENT_PACKAGE: &str = "thepackage";
@@ -48,9 +50,17 @@ macro_rules! assert_js {
             $crate::javascript::tests::compile_js($src, vec![$(($crate::javascript::tests::CURRENT_PACKAGE, $name, $module_src)),*]);
             let mut output = String::from("----- SOURCE CODE\n");
             for (name, src) in [$(($name, $module_src)),*] {
-                output.push_str(&format!("-- {name}.gleam\n{src}\n\n"));
+                output.push_str("-- ");
+                output.push_str(name);
+                output.push_str(".gleam\n");
+                output.push_str(src);
+                output.push_str("\n\n");
             }
-            output.push_str(&format!("-- main.gleam\n{}\n\n----- COMPILED JAVASCRIPT\n{compiled}", $src));
+            output.push_str("-- main.gleam\n");
+            output.push_str($src);
+            output.push_str("\n\n----- COMPILED JAVASCRIPT\n");
+            output.push_str(&compiled);
+
         insta::assert_snapshot!(insta::internals::AutoName, output, $src);
     };
 
@@ -141,7 +151,7 @@ macro_rules! assert_ts_def {
 }
 
 pub fn compile(src: &str, deps: Vec<(&str, &str, &str)>) -> TypedModule {
-    let mut modules = im::HashMap::new();
+    let mut modules = imbl::HashMap::new();
     let ids = UniqueIdGenerator::new();
     // DUPE: preludeinsertion
     // TODO: Currently we do this here and also in the tests. It would be better
@@ -173,7 +183,7 @@ pub fn compile(src: &str, deps: Vec<(&str, &str, &str)>) -> TypedModule {
             importable_modules: &modules,
             warnings: &TypeWarningEmitter::null(),
             direct_dependencies: &HashMap::new(),
-            dev_dependencies: &std::collections::HashSet::new(),
+            dev_dependencies: &HashSet::new(),
             target_support: TargetSupport::Enforced,
             package_config: &dep_config,
         }
@@ -192,21 +202,19 @@ pub fn compile(src: &str, deps: Vec<(&str, &str, &str)>) -> TypedModule {
     let mut config = PackageConfig::default();
     config.name = "thepackage".into();
 
-    let module = crate::analyse::ModuleAnalyzerConstructor::<()> {
+    crate::analyse::ModuleAnalyzerConstructor::<()> {
         target: Target::JavaScript,
         ids: &ids,
         origin: Origin::Src,
         importable_modules: &modules,
         warnings: &TypeWarningEmitter::null(),
         direct_dependencies: &direct_dependencies,
-        dev_dependencies: &std::collections::HashSet::new(),
+        dev_dependencies: &HashSet::new(),
         target_support: TargetSupport::NotEnforced,
         package_config: &config,
     }
     .infer_module(ast, line_numbers, "src/module.gleam".into())
-    .expect("should successfully infer");
-
-    inline::module(module, &modules)
+    .expect("should successfully infer")
 }
 
 pub fn compile_js(src: &str, deps: Vec<(&str, &str, &str)>) -> String {
@@ -329,13 +337,11 @@ pub fn source_map_to_string(src: &str, compiled: &str, source_map: SourceMap) ->
             src_line_numbers.byte_index(Position::new(*next_src_line, *next_src_col)) as usize;
         let next_compiled_index =
             compiled_line_numbers.byte_index(Position::new(*next_dst_line, *next_dst_col)) as usize;
-        output.push_str(&format!("{}\n", &src[src_index..next_src_index]));
-        output.push_str("⏷\n");
-        output.push_str(&format!(
-            "{}\n",
-            &compiled[compiled_index..next_compiled_index]
-        ));
-        output.push_str("----- \n");
+
+        output.push_str(&src[src_index..next_src_index]);
+        output.push_str("\n⏷\n");
+        output.push_str(&compiled[compiled_index..next_compiled_index]);
+        output.push_str("\n----- \n");
         prev_compiled_index = next_compiled_index;
     }
     // Print the last mapping. this needs to be done separately because the last mapping
@@ -350,15 +356,17 @@ pub fn source_map_to_string(src: &str, compiled: &str, source_map: SourceMap) ->
             let next_src_index = src_line_numbers
                 .byte_index(Position::new(next_src_token.0, next_src_token.1))
                 as usize;
-            output.push_str(&format!("{}\n", &src[src_index..next_src_index]));
+            output.push_str(&src[src_index..next_src_index]);
+            output.push('\n');
         }
         None => {
             // If there is no next src token, print the rest of the source and compiled code
-            output.push_str(&format!("{}\n", &src[src_index..]));
+            output.push_str(&src[src_index..]);
+            output.push('\n');
         }
     }
     output.push_str("⏷\n");
-    output.push_str(&format!("{}\n", &compiled[prev_compiled_index..]));
-    output.push_str("----- \n");
+    output.push_str(&compiled[prev_compiled_index..]);
+    output.push_str("\n----- \n");
     output
 }

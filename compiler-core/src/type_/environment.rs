@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 use pubgrub::Range;
 
 use crate::{
@@ -19,7 +22,7 @@ pub struct EnvironmentArguments<'a> {
     pub gleam_version: Option<Range<Version>>,
     pub current_module: EcoString,
     pub target: Target,
-    pub importable_modules: &'a im::HashMap<EcoString, ModuleInterface>,
+    pub importable_modules: &'a imbl::HashMap<EcoString, ModuleInterface>,
     pub target_support: TargetSupport,
     pub current_origin: Origin,
     pub dev_dependencies: &'a HashSet<EcoString>,
@@ -29,6 +32,18 @@ impl<'a> EnvironmentArguments<'a> {
     pub fn build(self) -> Environment<'a> {
         Environment::new(self)
     }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct UnqualifiedImport {
+    /// The location of the import. For example:
+    /// ```gleam
+    /// import gleam/result.{type Result as MyResult}
+    /// //                   ^^^^^^^^^^^^^^^^^^^^^^^
+    /// ```
+    pub location: SrcSpan,
+    /// Whether the unqualified import has been aliased.
+    pub has_alias: bool,
 }
 
 #[derive(Debug)]
@@ -44,22 +59,23 @@ pub struct Environment<'a> {
     pub target: Target,
     pub ids: UniqueIdGenerator,
     previous_id: u64,
-    /// Names of types or values that have been imported an unqualified fashion
-    /// from other modules. Used to prevent multiple imports using the same name.
-    pub unqualified_imported_names: HashMap<EcoString, SrcSpan>,
-    pub unqualified_imported_types: HashMap<EcoString, SrcSpan>,
-    pub importable_modules: &'a im::HashMap<EcoString, ModuleInterface>,
+    /// Names of types or values that have been imported in unqualified fashion
+    /// from other modules. Used to prevent multiple imports using the same
+    /// name and to check if an item has an import alias.
+    pub unqualified_imported_names: HashMap<EcoString, UnqualifiedImport>,
+    pub unqualified_imported_types: HashMap<EcoString, UnqualifiedImport>,
+    pub importable_modules: &'a imbl::HashMap<EcoString, ModuleInterface>,
 
     /// Modules that have been imported by the current module, along with the
     /// location of the import statement where they were imported.
     pub imported_modules: HashMap<EcoString, (SrcSpan, &'a ModuleInterface)>,
 
     /// Values defined in the current function (or the prelude)
-    pub scope: im::HashMap<EcoString, ValueConstructor>,
+    pub scope: imbl::HashMap<EcoString, ValueConstructor>,
 
     // The names of all the ignored variables and arguments in scope:
     // `let _var = 10` `pub fn main(_var) { todo }`.
-    pub discarded_names: im::HashMap<EcoString, SrcSpan>,
+    pub discarded_names: imbl::HashMap<EcoString, SrcSpan>,
 
     /// Types defined in the current module (or the prelude)
     pub module_types: HashMap<EcoString, TypeConstructor>,
@@ -144,7 +160,7 @@ impl<'a> Environment<'a> {
             unqualified_imported_types: HashMap::new(),
             accessors: prelude.accessors.clone(),
             scope: prelude.values.clone().into(),
-            discarded_names: im::HashMap::new(),
+            discarded_names: imbl::HashMap::new(),
             importable_modules,
             current_module,
             local_variable_usages: vec![HashMap::new()],
@@ -160,7 +176,7 @@ impl<'a> Environment<'a> {
 
     fn build_names(
         prelude: &ModuleInterface,
-        importable_modules: &im::HashMap<EcoString, ModuleInterface>,
+        importable_modules: &imbl::HashMap<EcoString, ModuleInterface>,
     ) -> Names {
         let mut names = Names::new();
 
@@ -197,8 +213,8 @@ impl<'a> Environment<'a> {
 
 #[derive(Debug)]
 pub struct ScopeResetData {
-    local_values: im::HashMap<EcoString, ValueConstructor>,
-    discarded_names: im::HashMap<EcoString, SrcSpan>,
+    local_values: imbl::HashMap<EcoString, ValueConstructor>,
+    discarded_names: imbl::HashMap<EcoString, SrcSpan>,
 }
 
 impl Environment<'_> {
@@ -467,15 +483,28 @@ impl Environment<'_> {
                     }
                 })?;
                 self.references
-                    .register_module_reference(module_name.clone());
-                module.get_importable_type(name).ok_or_else(|| {
-                    UnknownTypeConstructorError::ModuleType {
+                    .register_module_reference_by_alias(module_name.clone());
+
+                match module.types.get(name) {
+                    Some(type_info) if type_info.publicity.is_importable() => Ok(type_info),
+                    // If the type belongs to current package, but isn't importable,
+                    // then we produce error message about usage of private type.
+                    Some(_) if self.current_package == module.package => {
+                        Err(UnknownTypeConstructorError::PrivateModuleType {
+                            name: name.clone(),
+                            module_name: module.name.clone(),
+                        })
+                    }
+                    // Otherwise, the type either doesn't exist or is from another
+                    // module, where we do not want to expose information, we produce
+                    // error message about usage of unknown type.
+                    Some(_) | None => Err(UnknownTypeConstructorError::ModuleType {
                         name: name.clone(),
                         module_name: module.name.clone(),
                         type_constructors: module.public_type_names(),
                         imported_type_as_value: false,
-                    }
-                })
+                    }),
+                }
             }
         }
     }
@@ -553,7 +582,7 @@ impl Environment<'_> {
                     }
                 })?;
                 self.references
-                    .register_module_reference(module_name.clone());
+                    .register_module_reference_by_alias(module_name.clone());
                 module.get_importable_value(name).ok_or_else(|| {
                     UnknownValueConstructorError::ModuleValue {
                         name: name.clone(),
@@ -580,6 +609,7 @@ impl Environment<'_> {
                 }
             })
             .cloned()
+            .sorted()
             .collect_vec()
     }
 
@@ -603,6 +633,7 @@ impl Environment<'_> {
                 }
             })
             .cloned()
+            .sorted()
             .collect_vec()
     }
 
@@ -645,7 +676,7 @@ impl Environment<'_> {
     pub fn instantiate(
         &mut self,
         t: Arc<Type>,
-        ids: &mut im::HashMap<u64, Arc<Type>>,
+        ids: &mut imbl::HashMap<u64, Arc<Type>>,
         hydrator: &Hydrator,
     ) -> Arc<Type> {
         match t.deref() {
@@ -1081,7 +1112,7 @@ pub fn unify(t1: Arc<Type>, t2: Arc<Type>) -> Result<(), UnifyError> {
                 // of the function, in which case accept the extra link.
                 if let Ok(mut type_) = type_.try_borrow_mut() {
                     *type_ = TypeVar::Link {
-                        type_: collapse_links(t.clone()),
+                        type_: collapse_links(t),
                     }
                 }
                 Ok(())
@@ -1154,7 +1185,7 @@ pub fn unify(t1: Arc<Type>, t2: Arc<Type>) -> Result<(), UnifyError> {
                     arguments1.len(),
                     &t2,
                     arguments2.len(),
-                ))?
+                ))?;
             }
 
             for (i, (a, b)) in arguments1.iter().zip(arguments2).enumerate() {

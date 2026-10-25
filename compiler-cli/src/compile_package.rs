@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 use crate::{
     CompilePackage, config,
     fs::{self, ConsoleWarningEmitter, ProjectIO},
@@ -7,9 +10,10 @@ use ecow::EcoString;
 use gleam_core::{
     Error, Result,
     build::{
-        Mode, NullTelemetry, PackageCompiler, StaleTracker, Target, TargetCodegenConfiguration,
+        ErlangAppCodegenConfiguration, ErlangOutput, Mode, NullTelemetry, PackageCompiler,
+        StaleTracker, Target, TargetCodegenConfiguration,
     },
-    error::{FileIoAction, FileKind},
+    error::{FileIoAction, FileIoCause, FileKind},
     metadata,
     paths::{self, ProjectPaths},
     type_::ModuleInterface,
@@ -21,13 +25,41 @@ use std::{collections::HashSet, rc::Rc};
 pub fn command(options: CompilePackage) -> Result<()> {
     let ids = UniqueIdGenerator::new();
     let mut type_manifests = load_libraries(&ids, &options.libraries_directory)?;
-    let mut defined_modules = im::HashMap::new();
+    let mut defined_modules = imbl::HashMap::new();
     let warnings = WarningEmitter::new(Rc::new(ConsoleWarningEmitter));
     let paths = ProjectPaths::new(options.package_directory.clone());
     let config = config::read(paths.root_config())?;
 
+    let io = ProjectIO::new();
+    // Initialise the BEAM compiler instance eagerly, so we don't have to wait
+    // for it to boot when we come to use it for the first time.
+    if options.target.is_erlang() && !options.skip_beam_compilation {
+        io.initialise_beam_compiler()?;
+    }
+    let mode = if options.no_dev {
+        Mode::Prod
+    } else {
+        Mode::Dev
+    };
+    let app_file = {
+        if options.skip_beam_compilation {
+            None
+        } else {
+            Some(ErlangAppCodegenConfiguration {
+                include_dev_deps: mode.includes_dev_dependencies(),
+                package_name_overrides: options.otp_app_names,
+            })
+        }
+    };
     let target = match options.target {
-        Target::Erlang => TargetCodegenConfiguration::Erlang { app_file: None },
+        Target::Erlang => TargetCodegenConfiguration::Erlang {
+            app_file,
+            output: if options.skip_beam_compilation {
+                ErlangOutput::Textual
+            } else {
+                ErlangOutput::Binary
+            },
+        },
         Target::JavaScript => TargetCodegenConfiguration::JavaScript {
             emit_typescript_definitions: false,
             emit_source_maps: false,
@@ -41,17 +73,16 @@ pub fn command(options: CompilePackage) -> Result<()> {
 
     let mut compiler = PackageCompiler::new(
         &config,
-        Mode::Dev,
+        mode,
         &options.package_directory,
         &options.output_directory,
         &options.libraries_directory,
         &target,
         ids,
-        ProjectIO::new(),
+        io,
     );
     compiler.write_entrypoint = false;
     compiler.write_metadata = true;
-    compiler.compile_beam_bytecode = !options.skip_beam_compilation;
     compiler
         .compile(
             &warnings,
@@ -68,9 +99,9 @@ pub fn command(options: CompilePackage) -> Result<()> {
 fn load_libraries(
     ids: &UniqueIdGenerator,
     lib: &Utf8Path,
-) -> Result<im::HashMap<EcoString, ModuleInterface>> {
+) -> Result<imbl::HashMap<EcoString, ModuleInterface>> {
     tracing::info!("Reading precompiled module metadata files");
-    let mut manifests = im::HashMap::new();
+    let mut manifests = imbl::HashMap::new();
     for lib in fs::read_dir(lib)?.filter_map(Result::ok) {
         let path = lib.path().join(paths::ARTEFACT_DIRECTORY_NAME);
         if !path.is_dir() {
@@ -79,13 +110,13 @@ fn load_libraries(
         for module in fs::module_caches_paths(path)? {
             let bytes = fs::read_bytes(module.clone())?;
             let module = match metadata::decode(&bytes, ids.clone()) {
-                Ok(module) => module,
-                Err(e) => {
+                Some(module) => module,
+                None => {
                     return Err(Error::FileIo {
                         kind: FileKind::File,
                         action: FileIoAction::Parse,
                         path: module,
-                        err: Some(e.to_string()),
+                        cause: FileIoCause::CacheMetadataFormatIncorrect,
                     });
                 }
             };

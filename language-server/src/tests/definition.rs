@@ -1,4 +1,10 @@
-use lsp_types::{DefinitionParams, Location, Position, Range, TypeDefinitionParams, Uri as Url};
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2024 The Gleam contributors
+
+use lsp_types::{
+    DefinitionParams, Location, PartialResultParams, Position, Range, TypeDefinitionParams,
+    Uri as Url, WorkDoneProgressParams,
+};
 
 use super::*;
 
@@ -6,8 +12,8 @@ fn definition(tester: &TestProject<'_>, position: Position) -> Option<Location> 
     tester.at(position, |engine, param, _| {
         let params = DefinitionParams {
             text_document_position_params: param,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
         };
         let response = engine.goto_definition(params);
         response.result.unwrap()
@@ -24,8 +30,8 @@ fn type_definition(tester: &TestProject<'_>, position: Position) -> Vec<Location
     tester.at(position, |engine, param, _| {
         let params = TypeDefinitionParams {
             text_document_position_params: param,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
         };
         let response = engine.goto_type_definition(params);
 
@@ -253,6 +259,20 @@ pub fn main() {
 }
 
 #[test]
+fn goto_definition_record_update_spread_variable() {
+    assert_goto!(
+        "
+pub type Wibble { Wibble(one: Int, two: Int) }
+
+pub fn main() {
+  let value = Wibble(one: 1, two: 2)
+  Wibble(..value, two: 3)
+}",
+        find_position_of("value").nth_occurrence(2)
+    );
+}
+
+#[test]
 fn goto_definition_same_module_constants() {
     assert_goto!(
         "
@@ -430,8 +450,8 @@ fn main() {
 
     let params = DefinitionParams {
         text_document_position_params: position_param.clone(),
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
     };
     let response = engine.goto_definition(params.clone());
     let response = response.result.unwrap();
@@ -504,8 +524,8 @@ fn main() {
 
     let params = DefinitionParams {
         text_document_position_params: position_param.clone(),
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
     };
 
     let response = engine.goto_definition(params.clone());
@@ -986,6 +1006,22 @@ const wobble = todo as wibble
 }
 
 #[test]
+fn goto_definition_record_field_access_unknown_variant() {
+    assert_goto!(
+        "
+pub type Shape {
+  Circle(label: String, radius: Float)
+  Rectangle(label: String, width: Float, height: Float)
+}
+
+pub fn get_label(s: Shape) -> String {
+  s.label
+}",
+        find_position_of("s.label").under_char('l')
+    );
+}
+
+#[test]
 fn goto_for_invalid_constant_todo_message_still_works_2() {
     assert_goto!(
         "
@@ -993,5 +1029,136 @@ const wibble = 1
 const wobble = todo as [wibble]
 ",
         find_position_of("wibble").nth_occurrence(2)
+    );
+}
+
+#[test]
+fn goto_definition_record_field_access() {
+    assert_goto!(
+        "
+pub type Person {
+  Person(name: String, age: Int)
+}
+
+pub fn main() {
+  let p = Person(name: \"Lucy\", age: 10)
+  p.name
+}",
+        find_position_of("p.name").under_char('n')
+    );
+}
+
+#[test]
+fn goto_definition_record_field_from_declaration() {
+    assert_goto!(
+        "
+pub type Person {
+  Person(name: String, age: Int)
+}",
+        find_position_of("name: String").under_char('n')
+    );
+}
+
+#[test]
+fn goto_definition_constructor_label() {
+    assert_goto!(
+        "
+pub type Things {
+  A(a: Int)
+  B(a: String)
+}
+
+pub fn main() {
+  B(a: \"hello\")
+}",
+        find_position_of("a: \"hello\"").under_char('a')
+    );
+}
+
+#[test]
+fn goto_definition_pattern_label() {
+    assert_goto!(
+        "
+pub type Things {
+  A(a: Int)
+  B(a: String)
+}
+
+pub fn main(thing: Things) {
+  case thing {
+    A(a: x) -> x
+    B(a: y) -> y
+  }
+}",
+        find_position_of("B(a: y)").under_char('a')
+    );
+}
+
+#[test]
+fn goto_definition_nested_pattern_label() {
+    assert_goto!(
+        "
+pub type Inner {
+  Inner(b: String)
+}
+
+pub type Outer {
+  Outer(a: Inner)
+}
+
+pub fn main(x: Outer) {
+  case x {
+    Outer(a: Inner(b: y)) -> y
+  }
+}",
+        find_position_of("b: y").under_char('b')
+    );
+}
+
+#[test]
+fn goto_definition_function_argument_label() {
+    assert_goto!(
+        "
+pub fn replace(in string: String, each pattern: String) -> String {
+  todo
+}
+
+pub fn main() {
+  replace(in: \"hello\", each: \"l\")
+}",
+        find_position_of("in: \"hello\"").under_char('i')
+    );
+}
+
+#[test]
+fn goto_definition_function_argument_label_in_other_module() {
+    let src = "
+import wibble
+
+pub fn main() {
+  wibble.replace(in: \"hello\", each: \"l\")
+}";
+
+    assert_goto!(
+        TestProject::for_source(src).add_module(
+            "wibble",
+            "pub fn replace(in string: String, each pattern: String) -> String {\n  todo\n}"
+        ),
+        find_position_of("in: \"hello\"").under_char('i')
+    );
+}
+
+#[test]
+fn goto_definition_function_argument_label_from_definition() {
+    assert_goto!(
+        "
+pub fn replace(in string: String, each pattern: String) -> String {
+  todo
+}
+
+pub fn main() {
+  replace(in: \"hello\", each: \"l\")
+}",
+        find_position_of("in string").under_char('i')
     );
 }

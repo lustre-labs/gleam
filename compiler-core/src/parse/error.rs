@@ -1,9 +1,13 @@
-use crate::ast::{SrcSpan, TypeAst};
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
+use crate::ast::{RecordConstructorArg, TypeAst};
 use crate::diagnostic::{ExtraLabel, Label};
 use crate::error::{wrap, wrap_format};
 use crate::parse::Token;
 use ecow::EcoString;
 use itertools::Itertools;
+use src_span::SrcSpan;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct LexicalError {
@@ -40,9 +44,13 @@ pub enum LexicalErrorType {
     // Unterminated string literal
     UnexpectedStringEnd,
     UnrecognizedToken {
-        tok: char,
+        token: char,
     },
     InvalidTripleEqual,
+    MergeConflictIndicator,
+    /// Operators that commonly exist in procedural language, but do
+    /// not exist in Gleam. e.g. `++`, `-=`, `/=`, `%=`, `+=`, `*=`
+    UnsupportedProceduralOperator,
     /// A character was encountered that visually looks like a correct
     /// character, but in reality it's some other unicode characters.
     /// For example, a non-breaking-space instead of a regular space.
@@ -58,6 +66,25 @@ pub struct ParseError {
     pub location: SrcSpan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where we found an incorrect name.
+pub enum IncorrectNamePosition {
+    /// After `as`. For example: `as _wibble`.
+    AsPattern,
+    /// As a module in an import: `import _wibble`
+    Module,
+    /// As a function name: `fn _wibble()`
+    Function,
+    /// As an attribute name: `@_wibble`
+    Attribute,
+    /// As a constant name: `const _wibble = ...`
+    Constant,
+    /// As a target name: `@external(_wibble, ...)`
+    Target,
+    /// Used as a variable expression: `let a = _wibble`, `let a = _wibble(10)`
+    Variable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseErrorType {
     ExpectedEqual,              // expect "="
@@ -69,16 +96,21 @@ pub enum ParseErrorType {
     ExpectedValue,              // no value after "="
     ExpectedDefinition,         // after attributes
     ExpectedDeprecationMessage, // after "deprecated"
+    ExpectedExternalArguments,  // after "@external"
     ExpectedFunctionDefinition, // after function-only attributes
     ExpectedTargetName,         // after "@target("
     ExprLparStart,              // it seems "(" was used to start an expression
     ExtraSeparator,             // #(1,,) <- the 2nd comma is an extra separator
-    IncorrectName,              // UpName or DiscardName used when Name was expected
-    IncorrectUpName,            // Name or DiscardName used when UpName was expected
-    InvalidBitArraySegment,     // <<7:hello>> `hello` is an invalid BitArray segment
-    InvalidBitArrayUnit,        // in <<1:unit(x)>> x must be 1 <= x <= 256
-    InvalidTailPattern,         // only name and _name are allowed after ".." in list pattern
-    InvalidTupleAccess,         // only positive int literals for tuple access
+    // UpName or DiscardName used when Name was expected
+    IncorrectName {
+        // Where we found the incorrect name.
+        kind: IncorrectNamePosition,
+    },
+    IncorrectUpName,        // Name or DiscardName used when UpName was expected
+    InvalidBitArraySegment, // <<7:hello>> `hello` is an invalid BitArray segment
+    InvalidBitArrayUnit,    // in <<1:unit(x)>> x must be 1 <= x <= 256
+    InvalidTailPattern,     // only name and _name are allowed after ".." in list pattern
+    InvalidTupleAccess,     // only positive int literals for tuple access
     LexError {
         error: LexicalError,
     },
@@ -118,12 +150,23 @@ pub enum ParseErrorType {
     RedundantInternalAttribute,          // for a private definition marked as internal
     InvalidModuleTypePattern,            // for patterns that have a dot like: `name.thing`
     ListPatternSpreadFollowedByElements, // When there is a pattern after a spread [..rest, pattern]
+
+    /// This happens when someone forgets to write the type constructor around
+    /// its fields in a custom type definition. For example:
+    ///
+    /// ```gleam
+    /// pub type Wibble {
+    ///   String,
+    ///   field: Int,
+    ///   field_2: a,
+    /// }
+    /// ```
     ExpectedRecordConstructor {
-        name: EcoString,
+        type_name: EcoString,
         public: bool,
         opaque: bool,
-        field: EcoString,
-        field_type: Option<Box<TypeAst>>,
+        /// Those are the fields that have been written.
+        fields: Vec<RecordConstructorArg<()>>,
     },
     CallInClauseGuard, // case x { _ if f() -> 1 }
     IfExpression,
@@ -153,6 +196,7 @@ pub enum ParseErrorType {
     },
     // `const x = todo as` with no message after the `as`.
     MissingConstantAsMessage,
+    RecordUpdateAfterFields,
 }
 
 pub(crate) struct ParseErrorDetails {
@@ -228,6 +272,13 @@ impl ParseErrorType {
                 extra_labels: vec![],
             },
 
+            ParseErrorType::ExpectedExternalArguments => ParseErrorDetails {
+                text: "".into(),
+                hint: Some("See https://tour.gleam.run/advanced-features/externals/".into()),
+                label_text: "This attribute is incomplete".into(),
+                extra_labels: vec![],
+            },
+
             ParseErrorType::ExpectedFunctionDefinition => ParseErrorDetails {
                 text: "".into(),
                 hint: None,
@@ -260,15 +311,26 @@ tuples are created with `#(` and `)`."
                 extra_labels: vec![],
             },
 
-            ParseErrorType::IncorrectName => ParseErrorDetails {
-                text: "".into(),
-                hint: Some(wrap(
-                    "Variable and module names start with a lowercase letter, \
-and can contain a-z, 0-9, or _.",
-                )),
-                label_text: "I'm expecting a lowercase name here".into(),
-                extra_labels: vec![],
-            },
+            ParseErrorType::IncorrectName { kind } => {
+                let subject = match kind {
+                    IncorrectNamePosition::AsPattern => "A name after `as`",
+                    IncorrectNamePosition::Module => "A module name",
+                    IncorrectNamePosition::Function => "A function name",
+                    IncorrectNamePosition::Attribute => "An attribute name",
+                    IncorrectNamePosition::Constant => "A constant name",
+                    IncorrectNamePosition::Target => "A target name",
+                    IncorrectNamePosition::Variable => "A variable name",
+                };
+                ParseErrorDetails {
+                    text: wrap_format!(
+                        "{subject} must start with a lowercase letter, and can \
+contain a-z, 0-9, or _.",
+                    ),
+                    hint: None,
+                    label_text: "I'm expecting a lowercase name here".into(),
+                    extra_labels: vec![],
+                }
+            }
 
             ParseErrorType::IncorrectUpName => ParseErrorDetails {
                 text: "".into(),
@@ -639,11 +701,10 @@ See: https://tour.gleam.run/flow-control/case-expressions/"
             },
 
             ParseErrorType::ExpectedRecordConstructor {
-                name,
+                type_name,
                 public,
                 opaque,
-                field,
-                field_type,
+                fields,
             } => {
                 let (accessor, opaque) = match *public {
                     true if *opaque => ("pub ", "opaque "),
@@ -651,22 +712,29 @@ See: https://tour.gleam.run/flow-control/case-expressions/"
                     false => ("", ""),
                 };
 
-                let mut annotation = EcoString::new();
-                match field_type {
-                    Some(t) => t.print(&mut annotation),
-                    None => annotation.push_str("Type"),
-                };
+                let fields = fields
+                    .iter()
+                    .map(|field| {
+                        let mut type_ = EcoString::new();
+                        field.ast.print(&mut type_);
+
+                        match field.label.as_ref() {
+                            Some((_, label)) => format!("    {label}: {type_},"),
+                            None => format!("    {type_},"),
+                        }
+                    })
+                    .join("\n");
 
                 ParseErrorDetails {
-                    text: [
-                        "Each custom type variant must have a constructor:\n".into(),
-                        format!("{accessor}{opaque}type {name} {{"),
-                        format!("  {name}("),
-                        format!("    {field}: {annotation},"),
-                        "  )".into(),
-                        "}".into(),
-                    ]
-                    .join("\n"),
+                    text: format!(
+                        "Each custom type variant must have a constructor:
+
+{accessor}{opaque}type {type_name} {{
+  {type_name}(
+{fields}
+  )
+}}"
+                    ),
                     hint: None,
                     label_text: "I was not expecting this".into(),
                     extra_labels: vec![],
@@ -815,6 +883,20 @@ See: https://tour.gleam.run/data-types/generic-custom-types/"
                     extra_labels: vec![],
                 }
             }
+
+            ParseErrorType::RecordUpdateAfterFields => ParseErrorDetails {
+                text: "\
+When updating a record, the previous record comes before the fields to change
+
+    let record = Record(field1:, field2:)
+    let updated_record = Record(..record, field1: \"new_value\")
+
+See: https://tour.gleam.run/data-types/record-updates/"
+                    .into(),
+                label_text: "I wasn't expecting a record update here".into(),
+                extra_labels: vec![],
+                hint: None,
+            },
         }
     }
 }
@@ -844,14 +926,14 @@ impl LexicalError {
             LexicalErrorType::UnexpectedStringEnd => {
                 ("The string starting here was left open", vec![])
             }
-            LexicalErrorType::UnrecognizedToken { tok } if *tok == ';' => (
+            LexicalErrorType::UnrecognizedToken { token } if *token == ';' => (
                 "Remove this semicolon",
                 vec![
                     "Hint: Semicolons used to be whitespace and did nothing.".into(),
                     "You can safely remove them without your program changing.".into(),
                 ],
             ),
-            LexicalErrorType::UnrecognizedToken { tok } if *tok == '\'' => (
+            LexicalErrorType::UnrecognizedToken { token } if *token == '\'' => (
                 "Unexpected single quote",
                 vec!["Hint: Strings are written with double quotes.".into()],
             ),
@@ -888,6 +970,39 @@ impl LexicalError {
                 vec![
                     "Gleam uses `==` to check for equality between two values.".into(),
                     "See: https://tour.gleam.run/basics/equality".into(),
+                ],
+            ),
+            LexicalErrorType::MergeConflictIndicator => (
+                "Merge conflict marker found",
+                vec![
+                    "Your code appears to have a merge conflict. Resolve it by removing
+the code you do not want to keep.
+
+If you are in a merge, the top chunk is the checked-out code, and the
+bottom chunk is the new code being merged.
+
+If you are in a rebase, the top chunk is the code being rebased onto,
+and the chunk section is the checked-out code which is being rebased.
+
+More information can be found in the official git documentation:
+https://git-scm.com/book/en/v2/Git-Tools-Advanced-Merging#_checking_out_conflicts"
+                        .into(),
+                ],
+            ),
+            LexicalErrorType::UnsupportedProceduralOperator => (
+                "Unknown operator",
+                vec![
+                    "Gleam is an immutable language and does not have any operators that
+change the value of an existing variable. You might want to create a
+new variable with the same name as the previous one:
+
+    let wibble = 10
+    let blobby = wibble
+    let wibble = wibble + 20
+    assert wibble == 30
+    assert blobby == 10
+"
+                    .into(),
                 ],
             ),
             LexicalErrorType::VisuallySimilarInvalidCharacter { name, correct } => (

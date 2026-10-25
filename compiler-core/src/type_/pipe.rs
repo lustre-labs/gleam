@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2021 The Gleam contributors
+
 use self::expression::CallKind;
 
 use super::*;
@@ -141,6 +144,12 @@ impl<'a, 'b, 'c> PipeTyper<'a, 'b, 'c> {
                             // Without lifting purity tracking into the type system,
                             // we have no idea whether it's pure or not!
                             self.expr_typer.purity = self.expr_typer.purity.merge(Purity::Unknown);
+
+                            // This syntax is deprecated.
+                            self.expr_typer
+                                .problems
+                                .warning(Warning::PipeIntoCallWhichReturnsFunction { location });
+
                             (
                                 PipelineAssignmentKind::FunctionCall,
                                 self.infer_apply_to_call_pipe(fun, arguments, location),
@@ -195,7 +204,7 @@ impl<'a, 'b, 'c> PipeTyper<'a, 'b, 'c> {
                 | UntypedExpr::Var { .. }
                 | UntypedExpr::List { .. }
                 | UntypedExpr::BinOp { .. }
-                | UntypedExpr::PipeLine { .. }
+                | UntypedExpr::Pipeline { .. }
                 | UntypedExpr::Case { .. }
                 | UntypedExpr::FieldAccess { .. }
                 | UntypedExpr::Tuple { .. }
@@ -381,7 +390,7 @@ impl<'a, 'b, 'c> PipeTyper<'a, 'b, 'c> {
                 };
                 self.expr_typer.problems.error(error);
             }
-        };
+        }
 
         TypedExpr::Call {
             location: function_location,
@@ -407,7 +416,7 @@ impl<'a, 'b, 'c> PipeTyper<'a, 'b, 'c> {
             | UntypedExpr::List { .. }
             | UntypedExpr::Call { .. }
             | UntypedExpr::BinOp { .. }
-            | UntypedExpr::PipeLine { .. }
+            | UntypedExpr::Pipeline { .. }
             | UntypedExpr::Case { .. }
             | UntypedExpr::FieldAccess { .. }
             | UntypedExpr::Tuple { .. }

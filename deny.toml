@@ -1,14 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2021 The Gleam contributors
+
 # https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = [
-    "RUSTSEC-2025-0141"
-]
 
 # https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
 [licenses]
 allow = [
+    "Apache-2.0 WITH LLVM-exception",
     "Apache-2.0",
     "BSD-3-Clause",
     "BSL-1.0",

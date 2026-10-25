@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 mod stale_package_remover;
-use crate::error::{FileIoAction, FileKind};
+use crate::error::{self, FileIoAction, FileIoCause, FileKind, did_you_mean};
 use crate::io::FileSystemReader;
 use crate::io::ordered_map;
 use crate::manifest::Manifest;
@@ -11,11 +14,13 @@ use ecow::EcoString;
 use globset::{Glob, GlobSetBuilder};
 use hexpm::version::{self, LowestVersion, Version};
 use http::Uri;
+use regex::Regex;
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{self};
 use std::marker::PhantomData;
+use std::sync::OnceLock;
 
 #[cfg(test)]
 use crate::manifest::ManifestPackage;
@@ -37,12 +42,6 @@ fn default_javascript_runtime() -> Runtime {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpdxLicense {
     pub licence: String,
-}
-
-impl ToString for SpdxLicense {
-    fn to_string(&self) -> String {
-        String::from(&self.licence)
-    }
 }
 
 impl<'de> Deserialize<'de> for SpdxLicense {
@@ -68,9 +67,29 @@ impl<'de> serde::de::Visitor<'de> for SpdxLicenseVisitor {
         E: serde::de::Error,
     {
         match spdx::license_id(value) {
-            None => Err(serde::de::Error::custom(format!(
-                "{value} is not a known SPDX License identifier"
-            ))),
+            None => {
+                if is_valid_license_ref(value) {
+                    Ok(SpdxLicense {
+                        licence: value.to_string(),
+                    })
+                } else {
+                    let suggestion = {
+                        let licence_names: Vec<EcoString> = spdx::identifiers::LICENSES
+                            .iter()
+                            .map(|licence| EcoString::from(licence.name))
+                            .collect();
+                        did_you_mean(value, &licence_names)
+                            .map_or_default(|suggestion| format!("\n\nHint: {suggestion}"))
+                    };
+
+                    Err(serde::de::Error::custom(error::wrap_format!(
+                        "This is not a valid SPDX licence identifier or custom licence reference.
+
+Custom licence references must start with `LicenseRef-` and contain only \
+alphabetical characters, numbers, dashes, and dots.{suggestion}"
+                    )))
+                }
+            }
             Some(_) => Ok(SpdxLicense {
                 licence: value.to_string(),
             }),
@@ -125,9 +144,9 @@ impl GleamVersion {
 
     pub fn new(spec: String) -> Result<GleamVersion> {
         let hex =
-            version::Range::new(spec.to_string()).map_err(|e| Error::InvalidVersionFormat {
+            version::Range::new(spec.to_string()).map_err(|error| Error::InvalidVersionFormat {
                 input: spec,
-                error: e.to_string(),
+                error: error.to_string(),
             })?;
         Ok(hex.into())
     }
@@ -303,7 +322,7 @@ impl PackageConfig {
                 Version::parse(COMPILER_VERSION).expect("Parse compiler semantic version");
 
             // We ignore the pre-release and build metadata when checking compatibility
-            let mut version_without_pre = compiler_version.clone();
+            let mut version_without_pre = compiler_version;
             version_without_pre.pre = vec![];
             version_without_pre.build = None;
             if !range.contains(&version_without_pre) {
@@ -344,11 +363,11 @@ fn deserialise_config<P: AsRef<Utf8Path>>(
     path: P,
     toml: String,
 ) -> std::result::Result<PackageConfig, Error> {
-    let config: PackageConfig = toml::from_str(&toml).map_err(|e| Error::FileIo {
+    let config: PackageConfig = toml::from_str(&toml).map_err(|error| Error::FileIo {
         action: FileIoAction::Parse,
         kind: FileKind::File,
         path: path.as_ref().to_path_buf(),
-        err: Some(e.to_string()),
+        cause: FileIoCause::Other(error.to_string()),
     })?;
     Ok(config)
 }
@@ -723,19 +742,19 @@ fn locked_version(name: &'static str, version: &'static str) -> (EcoString, Vers
 impl Default for PackageConfig {
     fn default() -> Self {
         Self {
-            name: Default::default(),
+            name: EcoString::new(),
             version: default_version(),
-            gleam_version: Default::default(),
-            description: Default::default(),
-            documentation: Default::default(),
-            dependencies: Default::default(),
-            erlang: Default::default(),
-            javascript: Default::default(),
-            repository: Default::default(),
-            dev_dependencies: Default::default(),
-            licences: Default::default(),
-            links: Default::default(),
-            internal_modules: Default::default(),
+            gleam_version: None,
+            description: EcoString::new(),
+            documentation: Docs::default(),
+            dependencies: HashMap::new(),
+            erlang: ErlangConfig::default(),
+            javascript: JavaScriptConfig::default(),
+            repository: None,
+            dev_dependencies: HashMap::new(),
+            licences: vec![],
+            links: vec![],
+            internal_modules: None,
             target: Target::Erlang,
         }
     }
@@ -972,7 +991,7 @@ impl Repository {
                 format!("https://git.sr.ht/~{user}/{repo}")
             }
             Repository::Tangled { repo, user, .. } => {
-                format!("https://tangled.sh/{user}/{repo}")
+                format!("https://tangled.org/{user}/{repo}")
             }
             Repository::Gitea {
                 repo, user, host, ..
@@ -1013,14 +1032,14 @@ pub struct Docs {
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 pub struct DocsPage {
     pub title: String,
-    #[serde(default, deserialize_with = "package_scoped_path::deserialize")]
+    #[serde(deserialize_with = "package_scoped_path::deserialize")]
     pub path: Utf8PathBuf,
-    #[serde(default, deserialize_with = "package_scoped_path::deserialize")]
+    #[serde(deserialize_with = "package_scoped_path::deserialize")]
     pub source: Utf8PathBuf,
 }
 
-mod package_scoped_path {
-    use camino::{Utf8Component, Utf8PathBuf};
+pub(crate) mod package_scoped_path {
+    use camino::Utf8PathBuf;
     use serde::{Deserialize, Deserializer, de::Error as _};
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Utf8PathBuf, D::Error>
@@ -1028,16 +1047,17 @@ mod package_scoped_path {
         D: Deserializer<'de>,
     {
         let path = Utf8PathBuf::deserialize(deserializer)?;
-        // Absolute paths are not permitted.
-        // On Windows paths starting with \\ are drive-relative, so absolute as
-        // far as we are concerned.
-        if path.is_absolute() || (cfg!(windows) && path.starts_with("\\")) {
-            return Err(D::Error::custom("paths must be relative"));
-        }
-        for component in path.components() {
-            if component == Utf8Component::ParentDir {
-                return Err(D::Error::custom("paths must not contain .. segments"));
-            }
+        crate::io::validate_safe_relative_path(&path).map_err(D::Error::custom)?;
+        Ok(path)
+    }
+
+    pub fn optional_deserialize<'de, D>(deserializer: D) -> Result<Option<Utf8PathBuf>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let path = Option::<Utf8PathBuf>::deserialize(deserializer)?;
+        if let Some(path) = &path {
+            crate::io::validate_safe_relative_path(path).map_err(D::Error::custom)?;
         }
         Ok(path)
     }
@@ -1231,13 +1251,22 @@ pub mod map_with_package_name_keys {
     }
 }
 
+static PACKAGE_NAME_PATTERN: OnceLock<Regex> = OnceLock::new();
+
 fn is_valid_package_name(name: &str) -> bool {
-    use regex::Regex;
-    use std::sync::OnceLock;
-    static PACKAGE_NAME_PATTERN: OnceLock<Regex> = OnceLock::new();
     PACKAGE_NAME_PATTERN
         .get_or_init(|| Regex::new("^[a-z][a-z0-9_]*$").expect("Package name regex"))
         .is_match(name)
+}
+
+static LICENSE_REF_PATTERN: OnceLock<Regex> = OnceLock::new();
+
+// Check that a license string is a valid SPDX LicenseRef, according to:
+// https://spdx.github.io/spdx-spec/v2.3/SPDX-license-expressions/
+fn is_valid_license_ref(licence: &str) -> bool {
+    LICENSE_REF_PATTERN
+        .get_or_init(|| Regex::new(r"^LicenseRef-[A-Za-z0-9\.-]+$").expect("LicenseRef regex"))
+        .is_match(licence)
 }
 
 #[test]
@@ -1508,4 +1537,47 @@ wibble = ">= 1.0.0 and < 2.0.0"
 "#;
     let canonical = deserialise_config("gleam.toml", toml.into()).expect("valid config");
     assert_eq!(canonical, hyphen_alternative)
+}
+
+#[test]
+fn valid_licence_ref() {
+    let input = r#"
+name = "my_project"
+version = "1.0.0"
+licences = ["LicenseRef-my.valid-licence4"]
+"#;
+
+    let config = toml::from_str::<PackageConfig>(input).unwrap();
+    assert_eq!(
+        config.licences,
+        vec![SpdxLicense {
+            licence: "LicenseRef-my.valid-licence4".to_string()
+        }]
+    );
+}
+
+#[test]
+fn invalid_licence_ref() {
+    let input = r#"
+name = "my_project"
+version = "1.0.0"
+licences = ["LicenseRef-my_invalid_licence"]
+"#;
+    let output = toml::from_str::<PackageConfig>(input)
+        .unwrap_err()
+        .to_string();
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn licence_typo() {
+    let input = r#"
+name = "my_project"
+version = "1.0.0"
+licences = ["MIIT"]
+"#;
+    let output = toml::from_str::<PackageConfig>(input)
+        .unwrap_err()
+        .to_string();
+    insta::assert_snapshot!(output);
 }

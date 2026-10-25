@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 use crate::{
     assert_error, assert_internal_module_error, assert_js_module_error, assert_module_error,
     assert_module_syntax_error,
@@ -398,6 +401,11 @@ fn wrong_number_of_subjects() {
 #[test]
 fn wrong_number_of_subjects_alternative_patterns() {
     assert_error!("case 1 { _, _ | _ | _, _, _ -> 1 }");
+}
+
+#[test]
+fn wrong_number_of_subjects_multiple_subjects() {
+    assert_error!("case 1, 2 { _ -> 1 }");
 }
 
 #[test]
@@ -2885,6 +2893,45 @@ pub fn want_result(wibble: fn() -> Result(Int, Bool)) {
     );
 }
 
+// https://github.com/gleam-lang/gleam/issues/5914
+#[test]
+fn do_not_suggest_wrapping_in_ok_if_expected_ok_type_is_unbound() {
+    assert_module_error!(
+        "
+pub fn main() {
+  wibble(wobble(todo))
+}
+
+pub fn wobble(arg: a) -> Result(a, String) {
+  todo
+}
+
+pub fn wibble(arg: Result(a, Int)) -> a {
+  todo
+}"
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/5914
+#[test]
+fn do_not_suggest_wrapping_in_error_if_expected_error_type_is_unbound() {
+    assert_module_error!(
+        "
+pub fn main() {
+  wibble(wobble(todo))
+}
+
+pub fn wobble(arg: a) -> Result(Int, a) {
+  todo
+}
+
+pub fn wibble(arg: Result(Float, a)) -> a {
+  todo
+}
+"
+    );
+}
+
 #[test]
 // https://github.com/gleam-lang/gleam/issues/4195
 fn let_assert_binding_cannot_be_used_in_panic_message() {
@@ -4206,6 +4253,72 @@ pub fn main() {
 }
 
 #[test]
+fn unknown_variable_suggest_two_modules() {
+    assert_module_error!(
+        (
+            "wibble",
+            "
+pub fn add(x: Int, y: Int) {
+    x + y
+}"
+        ),
+        (
+            "wobble",
+            "
+pub fn add(x: Int, y: Int) {
+    x + y
+}"
+        ),
+        "
+// When multiple modules export a matching value the suggestion should be
+// pluralised.
+
+import wibble
+import wobble
+pub fn main() {
+    add(1, 1)
+}"
+    );
+}
+
+#[test]
+fn unknown_variable_suggest_three_modules() {
+    assert_module_error!(
+        (
+            "wibble",
+            "
+pub fn add(x: Int, y: Int) {
+    x + y
+}"
+        ),
+        (
+            "wobble",
+            "
+pub fn add(x: Int, y: Int) {
+    x + y
+}"
+        ),
+        (
+            "wabble",
+            "
+pub fn add(x: Int, y: Int) {
+    x + y
+}"
+        ),
+        "
+// When multiple modules export a matching value the suggestion should be
+// pluralised.
+
+import wibble
+import wobble
+import wabble
+pub fn main() {
+    add(1, 1)
+}"
+    );
+}
+
+#[test]
 pub fn clause_guard_is_fault_tolerant() {
     assert_module_error!(
         r#"
@@ -4297,6 +4410,204 @@ fn constant_calling_constructor_with_no_arguments() {
         "
 pub type A { A }
 const a = A()
+"
+    );
+}
+
+#[test]
+fn constant_unsupported_binop() {
+    assert_module_error!("const a = 1 > 2");
+}
+
+#[test]
+fn constant_unsupported_binop_2() {
+    assert_module_error!("const a = 1 <=. 2");
+}
+
+#[test]
+fn multiple_constant_unsupported_binops() {
+    assert_module_error!(
+        "const a = [
+  1 + 2,
+  1 - 2,
+  \"this is ok\" <> \"no error here!\",
+  1 * 2,
+  1 >=. 3.0,
+]"
+    );
+}
+
+#[test]
+fn invalid_operator_in_constants_does_not_stop_analysis() {
+    assert_module_error!(
+        "
+// We will see an error here
+const a = 1 + 2
+// And an error here!
+const b = 1 - 2
+// And an error here!
+const c = 1 - does_not_exist
+"
+    );
+}
+
+#[test]
+fn import_of_private_value_in_the_same_package() {
+    assert_module_error!(
+        ("wibble", "const wobble = 0"),
+        "
+import wibble.{wobble}
+"
+    );
+}
+
+#[test]
+fn use_of_private_value_in_the_same_package() {
+    assert_module_error!(
+        ("wibble", "const wobble = 0"),
+        "
+import wibble
+
+pub fn go() {
+  wibble.wobble
+}
+"
+    );
+}
+
+#[test]
+fn import_of_private_value_in_other_package() {
+    assert_module_error!(
+        ("anotherpackage", "wibble", "const wobble = 0"),
+        "
+// Import of private value from another package should give error about unknown
+// module value.
+import wibble.{wobble}
+"
+    );
+}
+
+#[test]
+fn use_of_private_value_in_other_package() {
+    assert_module_error!(
+        ("anotherpackage", "wibble", "const wobble = 0"),
+        "
+import wibble
+
+pub fn go() {
+  // Use of private value from another package should give error about unknown
+  // module value.
+  wibble.wobble
+}
+"
+    );
+}
+
+#[test]
+fn import_of_private_type_in_the_same_package() {
+    assert_module_error!(
+        (
+            "wibble",
+            "
+type Wibble {
+  Wibble
+}
+"
+        ),
+        "
+import wibble.{type Wibble}
+"
+    );
+}
+
+#[test]
+fn use_of_private_type_in_the_same_package() {
+    assert_module_error!(
+        (
+            "wibble",
+            "
+type Wibble {
+  Wibble
+}
+"
+        ),
+        "
+import wibble
+
+pub fn go() -> wibble.Wibble {
+  todo
+}
+"
+    );
+}
+
+#[test]
+fn import_of_private_type_in_other_package() {
+    assert_module_error!(
+        (
+            "anotherpackage",
+            "wibble",
+            "
+type Wibble {
+  Wibble
+}
+"
+        ),
+        "
+// Import of private type from another package should give error about unknown
+// module value.
+import wibble.{type Wibble}
+"
+    );
+}
+
+#[test]
+fn use_of_private_type_in_other_package() {
+    assert_module_error!(
+        (
+            "anotherpackage",
+            "wibble",
+            "
+type Wibble {
+  Wibble
+}
+"
+        ),
+        "
+import wibble
+
+// Use of private type from another package should give error about unknown
+// module value.
+pub fn go() -> wibble.Wibble {
+  todo
+}
+"
+    );
+}
+
+#[test]
+fn cannot_update_constant_using_record_constructor() {
+    assert_module_error!(
+        "
+pub type Wibble { Wibble(a: Int, b: Int) }
+
+pub const wibble = Wibble
+
+pub const wobble = Wibble(..wibble)
+"
+    );
+}
+
+#[test]
+fn update_constant_depending_on_invalid_constant_does_not_panic() {
+    assert_module_error!(
+        "
+type Wibble {
+    Wibble(wibble: Int, wobble: Int)
+}
+
+const a = Wibble(wibble: 0)
+const b = Wibble(..a, wobble: 8)
 "
     );
 }

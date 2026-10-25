@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2024 The Gleam contributors
+
 use std::{collections::HashMap, sync::Arc};
 
 use ecow::{EcoString, eco_format};
@@ -7,6 +10,7 @@ use lsp_types::{
     Documentation, MarkupContent, MarkupKind, Position, Range, TextDocumentPositionParams,
     TextEdit,
 };
+use src_span::{LineNumbers, SrcSpan};
 use strum::IntoEnumIterator;
 use vec1::Vec1;
 
@@ -17,7 +21,6 @@ use gleam_core::{
         visit::Visit,
     },
     build::{Module, Origin},
-    line_numbers::LineNumbers,
     parse::{LiteralFloatValue, parse_int_value},
     type_::{
         self, Deprecation, FieldMap, ModuleInterface, PRELUDE_MODULE_NAME, PreludeType,
@@ -139,6 +142,66 @@ enum TypeCompletionContext {
     QualifiedType,
 }
 
+/// The form in which a value completion is needed in context.
+#[derive(Debug)]
+enum ValueCompletionContext {
+    /// The valye completion is for an unqualified import that doesn't have an
+    /// import list yet. So adding the value will also require adding braces:
+    ///
+    /// ```gleam
+    /// import wibble.Wib|
+    /// //           ^^^^^ We're typing this...
+    /// import wibble.{Wibble}
+    /// //           ^^^^^^^^^ ...so this will be the completion
+    /// ```
+    ///
+    UnqualifiedImport,
+
+    /// The value completion is for an unqualified import within already
+    /// existing braces.
+    ///
+    /// ```gleam
+    /// import wibble.{AlreadyImported, Wibb|}
+    /// //                              ^^^^^ We're typing this...
+    /// import wibble.{AlreadyImported, Wibble}
+    /// //                              ^^^^^^ ...so this will be the completion
+    /// ```
+    ///
+    UnqualifiedImportWithinBraces,
+
+    /// The value completion is for an unqualified value (for example something
+    /// coming from the prelude, or a value that was already imported in an
+    /// unqualified way).
+    ///
+    /// ```gleam
+    /// import wobble.{Wobble}
+    ///
+    /// pub fn new_wobble() {
+    ///   Wob|
+    /// //^^^^ We're typing this...
+    ///   Wobble
+    /// //^^^^^^ ... so this will be the completion
+    /// }
+    /// ```
+    ///
+    UnqualifiedValue,
+
+    /// The value completion is for a qualified value.
+    ///
+    /// ```gleam
+    /// import wobble
+    ///
+    /// pub fn new_wobble() {
+    ///   wobble.W|
+    /// //^^^^^^^^ We're typing this...
+    ///   wobble.Wobble
+    /// //^^^^^^^^^^^^^ ...so this will be the completion
+    /// }
+    /// ```
+    ///
+    QualifiedValue,
+}
+
 /// Represents the surroundings of the cursor when trying to figure out a
 /// completion.
 ///
@@ -237,16 +300,11 @@ impl CursorSurroundings {
         let remaining_label = new_text
             .strip_prefix(self.text_before_cursor.as_str())
             .and_then(|rest| rest.strip_suffix(self.text_after_cursor.as_str()));
-
         match remaining_label {
-            // The entire existing text is already the same as the new text we
-            // might want to add.
-            // In that case there's no need to perform any edit at all!
-            Some("") => None,
-
-            // This is one of the cases (like the one in the example above) were
-            // the label is a more complete version of the text surrounding the
-            // cursor. So we replace the entire range.
+            // The entire existing label is already the same as the text we want
+            // to add or (like in the example above) a more complete version of
+            // the text surrounding the cursor.
+            // So we replace the entire range with the new suggestion.
             Some(_) => Some(CompletionItemTextEdit::TextEdit(TextEdit {
                 range: self.surrounding_text_range,
                 new_text,
@@ -470,10 +528,12 @@ impl<'a, IO> Completer<'a, IO> {
             ))))
         } else {
             // Find where to start and end the import completion
-            let start = self.src_line_numbers.line_and_column_number(start_of_line);
+            let start = self
+                .src_line_numbers
+                .line_and_utf16_column_number(start_of_line);
             let end = self
                 .src_line_numbers
-                .line_and_column_number(end_of_line - 1);
+                .line_and_utf16_column_number(end_of_line - 1);
             let start = Position::new(start.line - 1, start.column + 6);
             let end = Position::new(end.line - 1, end.column - 1);
             let completions = self.complete_modules_for_import(start, end);
@@ -561,6 +621,11 @@ impl<'a, IO> Completer<'a, IO> {
                 name,
                 value,
                 &cursor_surroundings,
+                if within_braces {
+                    ValueCompletionContext::UnqualifiedImportWithinBraces
+                } else {
+                    ValueCompletionContext::UnqualifiedImport
+                },
                 CompletionKind::ImportedModule,
             ));
         }
@@ -582,7 +647,7 @@ impl<'a, IO> Completer<'a, IO> {
                     .config
                     .dev_dependencies
                     .keys(),
-            )
+            );
         }
 
         let already_imported: std::collections::HashSet<EcoString> =
@@ -639,7 +704,7 @@ impl<'a, IO> Completer<'a, IO> {
                     range: Range { start, end },
                     new_text: name.to_string(),
                 })),
-                ..Default::default()
+                ..CompletionItem::default()
             })
             .collect()
     }
@@ -684,7 +749,7 @@ impl<'a, IO> Completer<'a, IO> {
                     detail: Some("Type".into()),
                     kind: Some(CompletionItemKind::Class),
                     sort_text,
-                    ..Default::default()
+                    ..CompletionItem::default()
                 });
             }
         }
@@ -744,7 +809,7 @@ impl<'a, IO> Completer<'a, IO> {
                             &cursor_surroundings,
                             TypeCompletionContext::UnqualifiedType,
                             CompletionKind::ImportedModule,
-                        ))
+                        ));
                     }
                 }
             }
@@ -846,7 +911,7 @@ impl<'a, IO> Completer<'a, IO> {
         if !cursor_surroundings.surrounding_text.is_empty() {
             for keyword in ["panic", "todo", "echo"] {
                 if keyword.starts_with(cursor_surroundings.surrounding_text.as_str()) {
-                    completions.push(self.keyword_completion(keyword, &cursor_surroundings))
+                    completions.push(self.keyword_completion(keyword, &cursor_surroundings));
                 }
             }
         }
@@ -890,6 +955,7 @@ impl<'a, IO> Completer<'a, IO> {
                     name,
                     value,
                     &cursor_surroundings,
+                    ValueCompletionContext::UnqualifiedValue,
                     CompletionKind::LocallyDefined,
                 ));
             }
@@ -898,7 +964,7 @@ impl<'a, IO> Completer<'a, IO> {
                 match match_type(&self.expected_type, &type_) {
                     TypeMatch::Incompatible => return,
                     TypeMatch::Matching | TypeMatch::Unknown => (),
-                };
+                }
 
                 let label = label.to_string();
                 let sort_text = Some(sort_text(
@@ -911,7 +977,7 @@ impl<'a, IO> Completer<'a, IO> {
                     detail: Some(PRELUDE_MODULE_NAME.into()),
                     kind: Some(kind),
                     sort_text,
-                    ..Default::default()
+                    ..CompletionItem::default()
                 });
             };
 
@@ -992,6 +1058,7 @@ impl<'a, IO> Completer<'a, IO> {
                         name,
                         value,
                         &cursor_surroundings,
+                        ValueCompletionContext::QualifiedValue,
                         CompletionKind::ImportedModule,
                     ));
                 }
@@ -1012,8 +1079,9 @@ impl<'a, IO> Completer<'a, IO> {
                             name,
                             value,
                             &cursor_surroundings,
+                            ValueCompletionContext::UnqualifiedValue,
                             CompletionKind::ImportedModule,
-                        ))
+                        ));
                     }
                 }
             }
@@ -1066,6 +1134,7 @@ impl<'a, IO> Completer<'a, IO> {
                     name,
                     value,
                     &cursor_surroundings,
+                    ValueCompletionContext::QualifiedValue,
                     CompletionKind::ImportableModule,
                 );
 
@@ -1085,7 +1154,7 @@ impl<'a, IO> Completer<'a, IO> {
     // Looks up the type accessors for the given type
     fn type_accessors_from_modules(
         &'a self,
-        importable_modules: &'a im::HashMap<EcoString, ModuleInterface>,
+        importable_modules: &'a imbl::HashMap<EcoString, ModuleInterface>,
         type_: Arc<Type>,
     ) -> Option<&'a HashMap<EcoString, RecordAccessor>> {
         let type_ = collapse_links(type_);
@@ -1112,14 +1181,14 @@ impl<'a, IO> Completer<'a, IO> {
     pub fn completion_field_accessors(&'a self, type_: Arc<Type>) -> Vec<CompletionItem> {
         if let Type::Named {
             publicity,
-            module: type_module,
+            package: type_package,
             ..
         } = type_.as_ref()
             && publicity.is_internal()
-            && *type_module != self.module.name
+            && *type_package != self.module.ast.type_info.package
         {
             // If we're asking for field completions for an internal type that
-            // is not defined in the current module we don't want to show
+            // is not defined in the current package, we don't want to show
             // anything. This makes it a lot harder to inadvertently rely on
             // internal implementation details without noticing.
             return vec![];
@@ -1141,7 +1210,7 @@ impl<'a, IO> Completer<'a, IO> {
     fn callable_field_map(
         &'a self,
         expr: &'a TypedExpr,
-        importable_modules: &'a im::HashMap<EcoString, ModuleInterface>,
+        importable_modules: &'a imbl::HashMap<EcoString, ModuleInterface>,
     ) -> Option<&'a FieldMap> {
         match expr {
             TypedExpr::Var { constructor, .. } => constructor.field_map(),
@@ -1221,7 +1290,7 @@ impl<'a, IO> Completer<'a, IO> {
                     detail,
                     kind: Some(CompletionItemKind::Field),
                     sort_text,
-                    ..Default::default()
+                    ..CompletionItem::default()
                 }
             })
             .collect()
@@ -1276,10 +1345,11 @@ impl<'a, IO> Completer<'a, IO> {
                 TypeMatch::Matching,
             )),
             text_edit: cursor_surrounding.to_text_edit(label),
-            ..Default::default()
+            ..CompletionItem::default()
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn value_completion(
         &self,
         module_qualifier: Option<&str>,
@@ -1287,6 +1357,7 @@ impl<'a, IO> Completer<'a, IO> {
         name: &str,
         value: &type_::ValueConstructor,
         cursor_surrounding: &CursorSurroundings,
+        value_completion_context: ValueCompletionContext,
         priority: CompletionKind,
     ) -> CompletionItem {
         let type_match = match_type(&self.expected_type, &value.type_);
@@ -1305,6 +1376,13 @@ impl<'a, IO> Completer<'a, IO> {
             ValueConstructorVariant::Record { .. } => CompletionItemKind::Constructor,
         });
 
+        let completion_text = match value_completion_context {
+            ValueCompletionContext::UnqualifiedImport => format!("{{{label}}}"),
+            ValueCompletionContext::UnqualifiedImportWithinBraces
+            | ValueCompletionContext::QualifiedValue
+            | ValueCompletionContext::UnqualifiedValue => label.clone(),
+        };
+
         let documentation = value.get_documentation().map(|documentation| {
             Documentation::MarkupContent(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -1322,8 +1400,8 @@ impl<'a, IO> Completer<'a, IO> {
             }),
             documentation,
             sort_text: Some(sort_text(priority, &label, type_match)),
-            text_edit: cursor_surrounding.to_text_edit(label),
-            ..Default::default()
+            text_edit: cursor_surrounding.to_text_edit(completion_text),
+            ..CompletionItem::default()
         }
     }
 
@@ -1336,7 +1414,7 @@ impl<'a, IO> Completer<'a, IO> {
             kind: Some(CompletionItemKind::Field),
             detail: Some(type_),
             sort_text: Some(sort_text(CompletionKind::FieldAccessor, label, type_match)),
-            ..Default::default()
+            ..CompletionItem::default()
         }
     }
 }
@@ -1387,7 +1465,7 @@ fn type_completion(
         detail: Some("Type".into()),
         sort_text: Some(sort_text(priority, &label, TypeMatch::Unknown)),
         text_edit: cursor_surrounding.to_text_edit(completion_text),
-        ..Default::default()
+        ..CompletionItem::default()
     }
 }
 
@@ -1512,7 +1590,7 @@ impl<'a> LocalCompletion<'a> {
                 range: insert_range,
                 new_text: label.clone(),
             })),
-            ..Default::default()
+            ..CompletionItem::default()
         }
     }
 }
@@ -1543,7 +1621,7 @@ impl<'ast> Visit<'ast> for LocalCompletion<'_> {
 
     fn visit_typed_expr_fn(
         &mut self,
-        location: &'ast ast::SrcSpan,
+        location: &'ast SrcSpan,
         _: &'ast Arc<Type>,
         _: &'ast FunctionLiteralKind,
         arguments: &'ast [ast::TypedArg],
@@ -1563,7 +1641,7 @@ impl<'ast> Visit<'ast> for LocalCompletion<'_> {
 
     fn visit_typed_expr_block(
         &mut self,
-        location: &'ast ast::SrcSpan,
+        location: &'ast SrcSpan,
         statements: &'ast [ast::TypedStatement],
     ) {
         // If we are completing after the block, any locally defined variables
@@ -1585,7 +1663,7 @@ impl<'ast> Visit<'ast> for LocalCompletion<'_> {
 
     fn visit_typed_pattern_variable(
         &mut self,
-        _: &'ast ast::SrcSpan,
+        _: &'ast SrcSpan,
         name: &'ast EcoString,
         type_: &'ast Arc<Type>,
         _origin: &'ast VariableOrigin,
@@ -1595,7 +1673,7 @@ impl<'ast> Visit<'ast> for LocalCompletion<'_> {
 
     fn visit_typed_pattern_discard(
         &mut self,
-        _: &'ast ast::SrcSpan,
+        _: &'ast SrcSpan,
         name: &'ast EcoString,
         type_: &'ast Arc<Type>,
     ) {
@@ -1604,23 +1682,28 @@ impl<'ast> Visit<'ast> for LocalCompletion<'_> {
 
     fn visit_typed_pattern_string_prefix(
         &mut self,
-        _: &'ast ast::SrcSpan,
-        _: &'ast ast::SrcSpan,
-        _: &'ast Option<(EcoString, ast::SrcSpan)>,
-        _: &'ast ast::SrcSpan,
+        _: &'ast SrcSpan,
+        _: &'ast SrcSpan,
+        string_prefix_left_side_assignment: &'ast Option<ast::StringPrefixLeftSideAssignment>,
+        _: &'ast SrcSpan,
         _: &'ast EcoString,
         right_side_assignment: &'ast ast::AssignName,
     ) {
+        if let Some(ast::StringPrefixLeftSideAssignment { name, .. }) =
+            string_prefix_left_side_assignment
+        {
+            self.push_completion(name, type_::string());
+        }
         self.push_completion(right_side_assignment.name(), type_::string());
     }
 
     fn visit_typed_pattern_assign(
         &mut self,
-        _: &'ast ast::SrcSpan,
+        _: &'ast SrcSpan,
         name: &'ast EcoString,
         pattern: &'ast Pattern<Arc<Type>>,
     ) {
         self.visit_typed_pattern(pattern);
-        self.push_completion(name, pattern.type_().clone());
+        self.push_completion(name, pattern.type_());
     }
 }

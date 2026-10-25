@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2023 The Gleam contributors
+
 use debug_ignore::DebugIgnore;
 use ecow::EcoString;
 use itertools::Itertools;
@@ -7,13 +10,13 @@ use gleam_core::{
     analyse::TargetSupport,
     build::{self, Mode, Module, NullTelemetry, Outcome, ProjectCompiler},
     config::PackageConfig,
-    io::{BeamCompiler, CommandExecutor, FileSystemReader, FileSystemWriter, Stdio},
-    line_numbers::LineNumbers,
+    io::{BeamCompilerIO, CommandExecutor, FileSystemReader, FileSystemWriter, Stdio},
     manifest::Manifest,
     paths::ProjectPaths,
     type_::ModuleInterface,
     warning::VectorWarningEmitterIO,
 };
+use src_span::LineNumbers;
 use std::{collections::HashMap, rc::Rc};
 
 use camino::Utf8PathBuf;
@@ -42,7 +45,7 @@ pub struct LspProjectCompiler<IO> {
 
 impl<IO> LspProjectCompiler<IO>
 where
-    IO: CommandExecutor + FileSystemWriter + FileSystemReader + BeamCompiler + Clone,
+    IO: CommandExecutor + FileSystemWriter + FileSystemReader + BeamCompilerIO + Clone,
 {
     pub fn new(
         manifest: Manifest,
@@ -72,6 +75,7 @@ where
             compile: build::Compile::All,
             root_target_support: TargetSupport::Enforced,
             no_print_progress: false,
+            erlang_output: build::ErlangOutput::Binary,
         };
         let mut project_compiler = ProjectCompiler::new(
             config,

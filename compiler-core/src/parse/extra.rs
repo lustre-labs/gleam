@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2021 The Gleam contributors
+
 use std::cmp::Ordering;
 
 use ecow::EcoString;
 
-use crate::ast::SrcSpan;
+use src_span::SrcSpan;
 
 #[derive(Debug, PartialEq, Eq, Default)]
 pub struct ModuleExtra {
@@ -16,7 +19,7 @@ pub struct ModuleExtra {
 
 impl ModuleExtra {
     pub fn new() -> Self {
-        Default::default()
+        Self::default()
     }
 
     /// Detects if a byte index is in a comment context
@@ -127,7 +130,9 @@ impl<'a> From<(&SrcSpan, &'a str)> for Comment<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ast::SrcSpan, parse::extra::ModuleExtra};
+    use src_span::SrcSpan;
+
+    use crate::parse::extra::ModuleExtra;
 
     fn set_up_extra() -> ModuleExtra {
         let mut extra = ModuleExtra::new();

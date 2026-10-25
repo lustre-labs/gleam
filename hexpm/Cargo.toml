@@ -1,6 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Gleam contributors
+
 [package]
 name = "hexpm"
-version = "1.17.0"
+version = "1.19.2"
 authors = ["Louis Pilfold <louis@lpil.uk>"]
 edition = "2024"
 license = "Apache-2.0"
@@ -39,7 +42,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 # toml encoding
-toml = "0.8"
+toml = "1.1"
 
 [build-dependencies]
 # Protobuf codegen

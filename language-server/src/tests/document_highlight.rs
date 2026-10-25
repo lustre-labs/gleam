@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2025 The Gleam contributors
+
 use lsp_types::{
     DocumentHighlightParams, PartialResultParams, Position, Range, TextDocumentPositionParams,
     WorkDoneProgressParams,
@@ -96,19 +99,23 @@ macro_rules! assert_highlights {
             } else {
                 &Vec::new()
             };
-            output.push_str(&format!(
-                "-- {name}.gleam\n{}\n\n",
-                show_highlights(src, None, highlights_in_module)
-            ));
+
+            output.push_str("-- ");
+            output.push_str(name);
+            output.push_str(".gleam\n");
+            output.push_str(&show_highlights(src, None, highlights_in_module));
+            output.push_str("\n\n");
         }
         let highlights_in_app_module = if module_name == "app" {
             &result
         } else {
             &Vec::new()
         };
-        output.push_str(&format!(
-            "-- app.gleam\n{}",
-            show_highlights(src, Some(position), highlights_in_app_module)
+        output.push_str("-- app.gleam\n");
+        output.push_str(&show_highlights(
+            src,
+            Some(position),
+            highlights_in_app_module,
         ));
 
         insta::assert_snapshot!(insta::internals::AutoName, output, src);
@@ -1140,5 +1147,37 @@ pub fn main() {
 }
 ",
         find_position_of("mod.wibble").under_char('w')
+    );
+}
+
+#[test]
+fn highlights_for_record_field_ignored_by_record_update_spread() {
+    assert_highlights!(
+        "
+type Wibble {
+  Wibble(wibble: Int, wobble: Int)
+}
+
+pub fn main(w: Wibble) {
+  Wibble(..w, wibble: 2)
+}
+",
+        find_position_of("wobble: Int").under_char('w'),
+    );
+}
+
+#[test]
+fn highlights_for_function_argument_label() {
+    assert_highlights!(
+        "
+pub fn replace(in string: String, each pattern: String) -> String {
+  todo
+}
+
+pub fn main() {
+  replace(in: \"hello\", each: \"l\")
+}
+",
+        find_position_of("in: \"hello\"").under_char('i')
     );
 }

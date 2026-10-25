@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
 use std::collections::HashSet;
 
 use camino::Utf8Path;
@@ -6,8 +9,8 @@ use ecow::EcoString;
 use crate::{
     Error,
     build::{
-        self, NullTelemetry, Outcome, PackageCompiler, StaleTracker, Target,
-        TargetCodegenConfiguration, Telemetry, package_compiler::Compiled,
+        self, ErlangOutput, NullTelemetry, Outcome, PackageCompiler, StaleTracker,
+        TargetCodegenConfiguration, package_compiler::Compiled,
     },
     config::PackageConfig,
     error::DefinedModuleOrigin,
@@ -21,7 +24,7 @@ fn compile_modules(
     module: &str,
     existing_modules: Vec<(&str, &str)>,
 ) -> Outcome<Compiled, Error> {
-    let mut fs = InMemoryFileSystem::new();
+    let fs = InMemoryFileSystem::new();
     fs.write(
         Utf8Path::new(&format!("/src/{module}.gleam")),
         "pub fn main() -> Nil { Nil }",
@@ -37,7 +40,10 @@ fn compile_modules(
         Utf8Path::new("/"),
         Utf8Path::new("/out"),
         Utf8Path::new("/lib"),
-        &TargetCodegenConfiguration::Erlang { app_file: None },
+        &TargetCodegenConfiguration::Erlang {
+            app_file: None,
+            output: ErlangOutput::Binary,
+        },
         UniqueIdGenerator::new(),
         fs,
     );
@@ -58,7 +64,7 @@ fn compile_modules(
 
     compiler.compile(
         &WarningEmitter::null(),
-        &mut im::HashMap::new(),
+        &mut imbl::HashMap::new(),
         &mut already_defined_modules,
         &mut StaleTracker::default(),
         &mut HashSet::new(),

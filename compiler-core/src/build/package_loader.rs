@@ -1,40 +1,40 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2022 The Gleam contributors
+
 #[cfg(test)]
 mod tests;
 
 use std::{
     collections::{HashMap, HashSet},
-    time::{Duration, SystemTime},
+    sync::OnceLock,
 };
 
 use camino::{Utf8Path, Utf8PathBuf};
 
 // TODO: emit warnings for cached modules even if they are not compiled again.
 
-use ecow::EcoString;
-use itertools::Itertools;
-use vec1::Vec1;
-
 use crate::{
     Error, Result,
-    ast::SrcSpan,
-    build::{Module, Origin, module_loader::ModuleLoader},
-    config::PackageConfig,
+    build::{Origin, module_loader::ModuleLoader},
     dep_tree,
-    error::{DefinedModuleOrigin, FileIoAction, FileKind, ImportCycleLocationDetails},
-    io::{self, CommandExecutor, FileSystemReader, FileSystemWriter, files_with_extension},
+    error::{DefinedModuleOrigin, FileIoAction, FileIoCause, FileKind, ImportCycleLocationDetails},
+    io::{CommandExecutor, FileSystemReader, FileSystemWriter, files_with_extension},
     metadata,
     paths::ProjectPaths,
     type_,
     uid::UniqueIdGenerator,
     warning::WarningEmitter,
 };
+use ecow::EcoString;
+use itertools::Itertools;
+use regex::Regex;
+use src_span::SrcSpan;
+use vec1::Vec1;
 
 use super::{
     Mode, Target,
     module_loader::read_source,
-    package_compiler::{
-        CacheMetadata, CachedModule, CachedWarnings, Input, Loaded, UncompiledModule,
-    },
+    package_compiler::{CachedModule, CachedWarnings, Input, Loaded, UncompiledModule},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +65,7 @@ pub struct PackageLoader<'a, IO> {
     package_name: &'a EcoString,
     target: Target,
     stale_modules: &'a mut StaleTracker,
-    already_defined_modules: &'a mut im::HashMap<EcoString, DefinedModuleOrigin>,
+    already_defined_modules: &'a mut imbl::HashMap<EcoString, DefinedModuleOrigin>,
     incomplete_modules: &'a HashSet<EcoString>,
     cached_warnings: CachedWarnings,
 }
@@ -74,6 +74,7 @@ impl<'a, IO> PackageLoader<'a, IO>
 where
     IO: FileSystemWriter + FileSystemReader + CommandExecutor + Clone,
 {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         io: IO,
         ids: UniqueIdGenerator,
@@ -86,7 +87,7 @@ where
         target: Target,
         package_name: &'a EcoString,
         stale_modules: &'a mut StaleTracker,
-        already_defined_modules: &'a mut im::HashMap<EcoString, DefinedModuleOrigin>,
+        already_defined_modules: &'a mut imbl::HashMap<EcoString, DefinedModuleOrigin>,
         incomplete_modules: &'a HashSet<EcoString>,
     ) -> Self {
         Self {
@@ -115,10 +116,10 @@ where
         // Check for any removed modules, by looking at cache files that don't exist in inputs.
         // Delete the cache files for removed modules and mark them as stale
         // to trigger refreshing dependent modules.
-        for module in CacheFiles::modules_with_meta_files(&self.io, &self.artefact_directory) {
-            if (!inputs.contains_key(&module)) {
+        for module in CacheFiles::modules_with_meta_files(&self.io, self.artefact_directory) {
+            if !inputs.contains_key(&module) {
                 tracing::debug!(%module, "module_removed");
-                CacheFiles::new(&self.artefact_directory, &module).delete(&self.io)?;
+                CacheFiles::new(self.artefact_directory, &module).delete(&self.io)?;
                 self.stale_modules.add(module);
             }
         }
@@ -152,27 +153,29 @@ where
 
             match input {
                 // A new uncached module is to be compiled
-                Input::New(module) => {
+                Input::New { module } => {
                     tracing::debug!(module = %module.name, "new_module_to_be_compiled");
                     self.stale_modules.add(module.name.clone());
-                    loaded.to_compile.push(module);
+                    loaded.to_compile.push(*module);
                 }
 
                 // A cached module with dependencies that are stale must be
                 // recompiled as the changes in the dependencies may have affect
                 // the output, making the cache invalid.
-                Input::Cached(info) if self.stale_modules.includes_any(&info.dependencies) => {
-                    tracing::debug!(module = %info.name, "stale_module_to_be_compiled");
-                    self.stale_modules.add(info.name.clone());
-                    let module = self.load_stale_module(info)?;
+                Input::Cached { module }
+                    if self.stale_modules.includes_any(&module.dependencies) =>
+                {
+                    tracing::debug!(module = %module.name, "stale_module_to_be_compiled");
+                    self.stale_modules.add(module.name.clone());
+                    let module = self.load_stale_module(&module)?;
                     loaded.to_compile.push(module);
                 }
 
                 // A cached module with no stale dependencies can be used as-is
                 // and does not need to be recompiled.
-                Input::Cached(info) => {
-                    tracing::debug!(module = %info.name, "module_to_load_from_cache");
-                    let module = self.load_cached_module(info)?;
+                Input::Cached { module } => {
+                    tracing::debug!(module = %module.name, "module_to_load_from_cache");
+                    let module = self.load_cached_module(module)?;
                     loaded.cached.push(module);
                 }
             }
@@ -182,16 +185,16 @@ where
     }
 
     fn load_cached_module(&self, info: CachedModule) -> Result<type_::ModuleInterface, Error> {
-        let cache_files = CacheFiles::new(&self.artefact_directory, &info.name);
+        let cache_files = CacheFiles::new(self.artefact_directory, &info.name);
         let bytes = self.io.read_bytes(&cache_files.cache_path)?;
         let mut module = match metadata::decode(bytes.as_slice(), self.ids.clone()) {
-            Ok(module) => module,
-            Err(e) => {
+            Some(module) => module,
+            None => {
                 return Err(Error::FileIo {
                     kind: FileKind::File,
                     action: FileIoAction::Parse,
                     path: cache_files.cache_path,
-                    err: Some(e.to_string()),
+                    cause: FileIoCause::CacheMetadataFormatIncorrect,
                 });
             }
         };
@@ -274,14 +277,14 @@ where
         // "code". Emit an error so this never happens.
         if self.target.is_erlang() {
             for (_, input) in inputs.collection.values() {
-                ensure_gleam_module_does_not_overwrite_standard_erlang_module(&input)?;
+                ensure_gleam_module_does_not_overwrite_standard_erlang_module(input)?;
             }
         }
 
         Ok(inputs.collection)
     }
 
-    fn load_stale_module(&self, cached: CachedModule) -> Result<UncompiledModule> {
+    fn load_stale_module(&self, cached: &CachedModule) -> Result<UncompiledModule> {
         let mtime = self.io.modification_time(&cached.source_path)?;
 
         // We need to delete any existing cache files for this module.
@@ -289,14 +292,15 @@ where
         // next time the dependencies might no longer be stale, but we still need to be able to tell
         // that this module needs to be recompiled until it successfully compiles at least once.
         // This can happen if the stale dependency includes breaking changes.
-        CacheFiles::new(&self.artefact_directory, &cached.name).delete(&self.io)?;
+        let cache_files = CacheFiles::new(self.artefact_directory, &cached.name);
+        cache_files.delete(&self.io)?;
 
         read_source(
             self.io.clone(),
             self.target,
             cached.origin,
-            cached.source_path,
-            cached.name,
+            cached.source_path.clone(),
+            cached.name.clone(),
             self.package_name.clone(),
             mtime,
             self.warnings.clone(),
@@ -321,11 +325,11 @@ where
                             .expect("importing module must exist");
                         let input = dep_location_map.get(module).expect("dependency must exist");
                         let location = match input {
-                            Input::New(module) => {
+                            Input::New { module } => {
                                 let (_, location) = module
                                     .dependencies
                                     .iter()
-                                    .find(|d| &d.0 == imported_module)
+                                    .find(|(name, _)| name == imported_module)
                                     .expect("import must exist for there to be a cycle");
                                 ImportCycleLocationDetails {
                                     location: *location,
@@ -333,11 +337,13 @@ where
                                     src: module.code.clone(),
                                 }
                             }
-                            Input::Cached(cached_module) => {
+                            Input::Cached {
+                                module: cached_module,
+                            } => {
                                 let (_, location) = cached_module
                                     .dependencies
                                     .iter()
-                                    .find(|d| &d.0 == imported_module)
+                                    .find(|(name, _)| name == imported_module)
                                     .expect("import must exist for there to be a cycle");
                                 let src = self
                                     .io
@@ -366,7 +372,7 @@ where
 fn ensure_gleam_module_does_not_overwrite_standard_erlang_module(input: &Input) -> Result<()> {
     // We only need to check uncached modules as it's not possible for these
     // to have compiled successfully.
-    let Input::New(input) = input else {
+    let Input::New { module } = input else {
         return Ok(());
     };
 
@@ -376,7 +382,7 @@ fn ensure_gleam_module_does_not_overwrite_standard_erlang_module(input: &Input) 
     // file:write_file("names.txt", lists:join("\n",lists:map(fun(T) -> erlang:element(1, T) end, code:all_available()))).
     // ```
     //
-    match input.name.as_str() {
+    match module.name.as_str() {
         "alarm_handler"
         | "application"
         | "application_controller"
@@ -1640,8 +1646,8 @@ fn ensure_gleam_module_does_not_overwrite_standard_erlang_module(input: &Input) 
     }
 
     Err(Error::GleamModuleWouldOverwriteStandardErlangModule {
-        name: input.name.clone(),
-        path: input.path.to_owned(),
+        name: module.name.clone(),
+        path: module.path.to_owned(),
     })
 }
 #[derive(Debug, Default)]
@@ -1653,7 +1659,7 @@ impl StaleTracker {
     }
 
     fn includes_any(&self, names: &[(EcoString, SrcSpan)]) -> bool {
-        names.iter().any(|n| self.0.contains(n.0.as_str()))
+        names.iter().any(|(name, _)| self.0.contains(name.as_str()))
     }
 
     pub fn empty(&mut self) {
@@ -1670,17 +1676,17 @@ pub struct Inputs<'a> {
     /// The name of the package for which we're loading the inputs.
     package: EcoString,
     collection: HashMap<EcoString, (DefinedModuleOrigin, Input)>,
-    already_defined_modules: &'a mut im::HashMap<EcoString, DefinedModuleOrigin>,
+    already_defined_modules: &'a mut imbl::HashMap<EcoString, DefinedModuleOrigin>,
 }
 
 impl<'a> Inputs<'a> {
     fn new(
         package: EcoString,
-        already_defined_modules: &'a mut im::HashMap<EcoString, DefinedModuleOrigin>,
+        already_defined_modules: &'a mut imbl::HashMap<EcoString, DefinedModuleOrigin>,
     ) -> Self {
         Self {
             package,
-            collection: Default::default(),
+            collection: HashMap::new(),
             already_defined_modules,
         }
     }
@@ -1700,7 +1706,7 @@ impl<'a> Inputs<'a> {
             .insert(name.clone(), origin.clone())
         {
             return Err(Error::DuplicateModule {
-                module: name.clone(),
+                module: name,
                 first,
                 second: origin,
             });
@@ -1727,10 +1733,12 @@ pub struct GleamFile {
     pub module_name: EcoString,
 }
 
+static IS_GLEAM_PATH_PATTERN: OnceLock<Regex> = OnceLock::new();
+
 impl GleamFile {
     pub fn new(dir: &Utf8Path, path: Utf8PathBuf) -> Self {
         Self {
-            module_name: Self::module_name(&path, &dir),
+            module_name: Self::module_name(&path, dir),
             path,
         }
     }
@@ -1746,7 +1754,7 @@ impl GleamFile {
     ) -> impl Iterator<Item = Result<Self, crate::Warning>> + 'b {
         tracing::trace!("gleam_source_files {:?}", dir);
         files_with_extension(io, dir, "gleam").map(move |path| {
-            if (Self::is_gleam_path(&path, &dir)) {
+            if Self::is_gleam_path(&path, dir) {
                 Ok(Self::new(dir, path))
             } else {
                 Err(crate::Warning::InvalidSource { path })
@@ -1778,23 +1786,20 @@ impl GleamFile {
     }
 
     fn is_gleam_path(path: &Utf8Path, dir: &Utf8Path) -> bool {
-        use regex::Regex;
-        use std::cell::OnceCell;
-        const RE: OnceCell<Regex> = OnceCell::new();
-
-        RE.get_or_init(|| {
-            Regex::new(&format!(
-                "^({module}{slash})*{module}\\.gleam$",
-                module = "[a-z][_a-z0-9]*",
-                slash = "(/|\\\\)",
-            ))
-            .expect("is_gleam_path() RE regex")
-        })
-        .is_match(
-            path.strip_prefix(dir)
-                .expect("is_gleam_path(): strip_prefix")
-                .as_str(),
-        )
+        IS_GLEAM_PATH_PATTERN
+            .get_or_init(|| {
+                Regex::new(&format!(
+                    "^({module}{slash})*{module}\\.gleam$",
+                    module = "[a-z][_a-z0-9]*",
+                    slash = "(/|\\\\)",
+                ))
+                .expect("is_gleam_path() RE regex")
+            })
+            .is_match(
+                path.strip_prefix(dir)
+                    .expect("is_gleam_path(): strip_prefix")
+                    .as_str(),
+            )
     }
 }
 
@@ -1821,7 +1826,7 @@ impl CacheFiles {
         }
     }
 
-    pub fn delete(&self, io: &dyn io::FileSystemWriter) -> Result<()> {
+    pub fn delete(&self, io: &dyn FileSystemWriter) -> Result<()> {
         io.delete_file(&self.cache_path)?;
         io.delete_file(&self.meta_path)
     }
@@ -1834,7 +1839,7 @@ impl CacheFiles {
         dir: &'a Utf8Path,
     ) -> impl Iterator<Item = EcoString> + 'a {
         tracing::trace!("CacheFiles::modules_with_meta_files {:?}", dir);
-        files_with_extension(io, dir, "cache_meta").map(move |path| Self::module_name(&dir, &path))
+        files_with_extension(io, dir, "cache_meta").map(move |path| Self::module_name(dir, &path))
     }
 
     fn module_name(dir: &Utf8Path, path: &Utf8Path) -> EcoString {

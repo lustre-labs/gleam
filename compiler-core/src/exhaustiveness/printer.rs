@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2024 The Gleam contributors
+
 use std::collections::HashMap;
 
 use ecow::EcoString;
@@ -189,7 +192,7 @@ impl<'a> Printer<'a> {
                         terms,
                         mapping,
                         buffer,
-                    )
+                    );
                 } else {
                     buffer.push('_');
                 }
@@ -204,7 +207,7 @@ impl<'a> Printer<'a> {
                         | Term::Infinite { .. }
                         | Term::List { .. } => {
                             buffer.push_str(", ");
-                            self.print_list(term, terms, mapping, buffer)
+                            self.print_list(term, terms, mapping, buffer);
                         }
                     }
                 } else {
@@ -220,16 +223,15 @@ mod tests {
     use ecow::EcoString;
 
     use super::Printer;
-    use std::{collections::HashMap, sync::Arc};
-
     use crate::{
-        ast::SrcSpan,
         exhaustiveness::{
             Variable,
             missing_patterns::{Term, VariantField},
         },
         type_::{Type, printer::Names},
     };
+    use src_span::SrcSpan;
+    use std::{collections::HashMap, sync::Arc};
 
     /// Create a variable with a dummy type, for ease of writing tests
     fn make_variable(id: usize) -> Variable {

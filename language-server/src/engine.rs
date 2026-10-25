@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2023 The Gleam contributors
+
 use camino::Utf8PathBuf;
 use ecow::{EcoString, eco_format};
 use gleam_core::{
@@ -5,15 +8,14 @@ use gleam_core::{
     analyse::name::correct_name_case,
     ast::{
         self, Constant, CustomType, DefinitionLocation, ModuleConstant, PatternUnusedArguments,
-        SrcSpan, TypedArg, TypedClauseGuard, TypedConstant, TypedExpr, TypedFunction, TypedModule,
+        TypedArg, TypedClauseGuard, TypedConstant, TypedExpr, TypedFunction, TypedModule,
         TypedPattern, TypedRecordConstructor,
     },
     build::{
         ExpressionPosition, Located, Module, UnqualifiedImport, type_constructor_from_modules,
     },
     config::PackageConfig,
-    io::{BeamCompiler, CommandExecutor, FileSystemReader, FileSystemWriter},
-    line_numbers::LineNumbers,
+    io::{BeamCompilerIO, CommandExecutor, FileSystemReader, FileSystemWriter},
     paths::ProjectPaths,
     type_::{
         self, Deprecation, ModuleInterface, Type, TypeConstructor, ValueConstructor,
@@ -30,39 +32,50 @@ use lsp_types::{
     MarkupContent, Position, PrepareRenameResult, Range, SignatureHelp, SymbolKind, SymbolTag,
     TextEdit, Uri as Url, WorkspaceEdit,
 };
-use std::{collections::HashSet, sync::Arc};
+use src_span::{LineNumbers, SrcSpan};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
-    code_action::{RemoveRedundantRecordUpdate, ReplaceUnderscoreWithType, type_errors_for_module},
+    code_action::{
+        ConvertIntToDifferentBase, DiscardUnusedVariable, RemoveRedundantRecordUpdate,
+        ReplaceUnderscoreWithType, code_action_fix_deprecated_pipe, type_errors_for_module,
+    },
     reference::find_module_references_in_module,
-    rename::rename_module_alias,
+    rename::{rename_module_alias, rename_module_occurrences, rename_type_variable},
 };
 
 use super::{
     DownloadDependencies, MakeLocker,
     code_action::{
         AddAnnotations, AddMissingTypeParameter, AddOmittedLabels, AnnotateTopLevelDefinitions,
-        CodeActionBuilder, CollapseNestedCase, ConvertFromUse, ConvertToFunctionCall,
-        ConvertToPipe, ConvertToUse, CreateUnknownModule, ExpandFunctionCapture, ExtractConstant,
-        ExtractFunction, ExtractVariable, FillInMissingLabelledArgs, FillUnusedFields,
-        FixBinaryOperation, FixTruncatedBitArraySegment, GenerateDynamicDecoder, GenerateFunction,
-        GenerateJsonEncoder, GenerateVariant, InlineVariable, InterpolateString, LetAssertToCase,
-        MergeCaseBranches, PatternMatchOnValue, RedundantTupleInCaseSubject, RemoveBlock,
-        RemoveEchos, RemovePrivateOpaque, RemoveUnreachableCaseClauses, RemoveUnusedImports,
+        CodeActionBuilder, CollapseNestedCase, ConvertBetweenDocAndRegularComment, ConvertFromUse,
+        ConvertToFunctionCall, ConvertToPipe, ConvertToUse, CreateUnknownModule,
+        ExpandFunctionCapture, ExtractConstant, ExtractFunction, ExtractVariable,
+        FillInMissingLabelledArgs, FillUnusedFields, FixBinaryOperation,
+        FixTruncatedBitArraySegment, GenerateDynamicDecoder, GenerateFunction, GenerateJsonEncoder,
+        GenerateVariant, InlineVariable, InterpolateString, LetAssertToCase, MergeCaseBranches,
+        PatternMatchOnValue, RedundantTupleInCaseSubject, RemoveBlock, RemoveEchos,
+        RemovePrivateOpaque, RemoveUnreachableCaseClauses, RemoveUnusedImports,
         UnwrapAnonymousFunction, UseLabelShorthandSyntax, WrapInAnonymousFunction, WrapInBlock,
         code_action_add_missing_patterns, code_action_convert_qualified_constructor_to_unqualified,
-        code_action_convert_unqualified_constructor_to_qualified, code_action_import_module,
-        code_action_inexhaustive_let_to_case,
+        code_action_convert_unqualified_constructor_to_qualified, code_action_generate_type,
+        code_action_import_module, code_action_inexhaustive_let_to_case,
     },
     compiler::LspProjectCompiler,
     completer::Completer,
     files::FileSystemProxy,
     progress::ProgressReporter,
     reference::{
-        FindVariableReferences, Referenced, VariableReferenceKind, find_module_references,
-        reference_for_ast_node,
+        FindVariableReferences, Referenced, VariableReferenceKind, find_label_references,
+        find_label_references_in_module, find_module_references, reference_for_ast_node,
     },
-    rename::{RenameOutcome, RenameTarget, Renamed, rename_local_variable, rename_module_entity},
+    rename::{
+        RenameOutcome, RenameTarget, Renamed, rename_label, rename_local_variable,
+        rename_module_entity,
+    },
     signature_help, src_span_to_lsp_range,
 };
 
@@ -109,7 +122,7 @@ where
     // IO to be supplied from outside of gleam-core
     IO: FileSystemReader
         + FileSystemWriter
-        + BeamCompiler
+        + BeamCompilerIO
         + CommandExecutor
         + DownloadDependencies
         + MakeLocker
@@ -251,7 +264,7 @@ where
             None => (params.text_document.uri.clone(), line_numbers),
             Some(name) => {
                 let module = self.compiler.get_source(&name)?;
-                let url = Url::parse(&format!("file:///{}", &module.path))
+                let url = Url::parse(&format!("file:///{}", module.path))
                     .expect("goto definition URL parse");
                 (url, &module.line_numbers)
             }
@@ -294,7 +307,8 @@ where
             let completions = match found {
                 Located::PatternSpread { .. } => None,
                 Located::Pattern(_pattern) => None,
-                Located::StringPrefixPatternVariable { .. } => None,
+                Located::StringPrefixPatternPrefixAlias { .. }
+                | Located::StringPrefixPatternSuffix { .. } => None,
 
                 // Do not show completions when typing inside a string.
                 Located::Expression {
@@ -401,7 +415,23 @@ where
 
                 Located::Annotation { .. } => Some(completer.completion_types()),
 
-                Located::Label(_, _) => None,
+                Located::Label { .. }
+                | Located::RecordLabelDefinition { .. }
+                | Located::RecordLabelUsage { .. }
+                | Located::FunctionLabelDefinition { .. }
+                | Located::FunctionLabelUsage { .. } => None,
+
+                Located::RecordAccessLabel {
+                    field_type,
+                    record_type,
+                    ..
+                } => {
+                    completer.expected_type = Some(field_type);
+                    let mut completions = vec![];
+                    completions.append(&mut completer.completion_values());
+                    completions.append(&mut completer.completion_field_accessors(record_type));
+                    Some(completions)
+                }
 
                 Located::ModuleName {
                     layer: ast::Layer::Type,
@@ -413,6 +443,8 @@ where
                 } => Some(completer.completion_values()),
 
                 Located::ClauseGuard(_) => Some(completer.completion_values()),
+
+                Located::TypeVariable { .. } => None,
             };
 
             Ok(completions)
@@ -431,10 +463,10 @@ where
 
             let lines = LineNumbers::new(&module.code);
 
-            code_action_unused_values(module, &lines, &params, &mut actions);
             actions.extend(RemoveUnusedImports::new(module, &lines, &params).code_actions());
             code_action_fix_names(module, &lines, &params, &this.error, &mut actions);
             code_action_import_module(module, &lines, &params, &this.error, &mut actions);
+            code_action_generate_type(module, &lines, &params, &this.error, &mut actions);
             code_action_add_missing_patterns(module, &lines, &params, &this.error, &mut actions);
             actions
                 .extend(RemoveUnreachableCaseClauses::new(module, &lines, &params).code_actions());
@@ -446,6 +478,7 @@ where
                 .extend(FixTruncatedBitArraySegment::new(module, &lines, &params).code_actions());
             actions.extend(RemovePrivateOpaque::new(module, &lines, &params).code_actions());
             actions.extend(AddMissingTypeParameter::new(module, &lines, &params).code_actions());
+            code_action_unused_values(module, &lines, &params, &mut actions);
             code_action_convert_qualified_constructor_to_unqualified(
                 module,
                 &this.compiler,
@@ -524,6 +557,12 @@ where
                 )
                 .code_actions(),
             );
+            actions.extend(DiscardUnusedVariable::new(module, &lines, &params).code_actions());
+            code_action_fix_deprecated_pipe(module, &lines, &params, &mut actions);
+            actions.extend(
+                ConvertBetweenDocAndRegularComment::new(module, &lines, &params).code_actions(),
+            );
+            actions.extend(ConvertIntToDifferentBase::new(module, &lines, &params).code_actions());
 
             actions.sort_by_key(|one| {
                 let preferred_key = if one.is_preferred == Some(true) { 0 } else { 1 };
@@ -592,7 +631,7 @@ where
                 // to be able to construct the 'DocumentSymbol' type, so
                 // we suppress the warning. We specify 'None' as specifying 'Some'
                 // is what is actually deprecated.
-                #[allow(deprecated)]
+                #[expect(deprecated)]
                 symbols.push(DocumentSymbol {
                     name: name.to_string(),
                     detail: Some(
@@ -621,7 +660,7 @@ where
                 // to be able to construct the 'DocumentSymbol' type, so
                 // we suppress the warning. We specify 'None' as specifying 'Some'
                 // is what is actually deprecated.
-                #[allow(deprecated)]
+                #[expect(deprecated)]
                 symbols.push(DocumentSymbol {
                     name: alias.alias.to_string(),
                     detail: Some(
@@ -664,7 +703,7 @@ where
                 // to be able to construct the 'DocumentSymbol' type, so
                 // we suppress the warning. We specify 'None' as specifying 'Some'
                 // is what is actually deprecated.
-                #[allow(deprecated)]
+                #[expect(deprecated)]
                 symbols.push(DocumentSymbol {
                     name: constant.name.to_string(),
                     detail: Some(
@@ -745,6 +784,49 @@ where
                 ranges.push(range);
             }
 
+            for doc_comment in comment_folding_spans(
+                &module.extra.doc_comments,
+                &module.code,
+                &line_numbers,
+                "///",
+            ) {
+                let Some(range) = folding_range_for_span(
+                    doc_comment,
+                    &line_numbers,
+                    Some(FoldingRangeKind::Comment),
+                ) else {
+                    continue;
+                };
+                ranges.push(range);
+            }
+
+            for module_comment in comment_folding_spans(
+                &module.extra.module_comments,
+                &module.code,
+                &line_numbers,
+                "////",
+            ) {
+                let Some(range) = folding_range_for_span(
+                    module_comment,
+                    &line_numbers,
+                    Some(FoldingRangeKind::Comment),
+                ) else {
+                    continue;
+                };
+                ranges.push(range);
+            }
+
+            for comment in
+                comment_folding_spans(&module.extra.comments, &module.code, &line_numbers, "//")
+            {
+                let Some(range) =
+                    folding_range_for_span(comment, &line_numbers, Some(FoldingRangeKind::Comment))
+                else {
+                    continue;
+                };
+                ranges.push(range);
+            }
+
             ranges.sort_by_key(|range| range.start_line);
             Ok(ranges)
         })
@@ -806,18 +888,22 @@ where
                             .map(|len: u32| location.start + len)
                             .unwrap_or(location.end),
                     }),
-                    Some(VariableSyntax::AssignmentPattern) | None => success_response(location),
+                    Some(VariableSyntax::AssignmentPattern { .. }) | None => {
+                        success_response(location)
+                    }
                 },
                 Some(
                     Referenced::ModuleValue {
                         module,
                         location,
+                        name_start,
                         target_kind,
                         ..
                     }
                     | Referenced::ModuleType {
                         module,
                         location,
+                        name_start,
                         target_kind,
                         ..
                     },
@@ -828,12 +914,54 @@ where
                         RenameTarget::Unqualified | RenameTarget::Definition => true,
                     };
                     if rename_allowed {
+                        // The location field is sometimes larger than the
+                        // location of the actual name. In most cases they are
+                        // the same, but in import statements that are for types
+                        // and/or are aliased, the location is larger than the
+                        // name.
+                        //
+                        // For example, in `import m.{type Wibble as Wobble}`,
+                        // location will cover `type Wibble as Wobble` but
+                        // the name is just `Wobble`. In every case (including
+                        // non-imports), the name is at the very end of the
+                        // location span.
+                        let location = SrcSpan {
+                            start: name_start,
+                            end: location.end,
+                        };
                         success_response(location)
                     } else {
                         None
                     }
                 }
-                Some(Referenced::ModuleName { location, .. }) => success_response(location),
+                Some(Referenced::ModuleName {
+                    location,
+                    module_alias,
+                    ..
+                }) => success_response(SrcSpan::new(
+                    // Since the location contains the full module name (e.g. `wibble/wobble/woo`),
+                    // we just want to include the last segment so we get a rename of the string
+                    // `woo`, as that's the being referenced in module access expressions.
+                    location.end - module_alias.len() as u32,
+                    location.end,
+                )),
+
+                Some(Referenced::TypeVariable { location, name: _ }) => success_response(location),
+
+                // For a label written using the shorthand syntax the location
+                // spans the whole `label:`, so we trim it down to just the
+                // label.
+                Some(Referenced::Label {
+                    location,
+                    label,
+                    owner,
+                    ..
+                }) if this.is_same_package(current_module, owner.module()) => {
+                    success_response(SrcSpan {
+                        start: location.start,
+                        end: location.start + label.len() as u32,
+                    })
+                }
 
                 _ => None,
             })
@@ -873,7 +1001,8 @@ where
                             VariableReferenceKind::LabelShorthand
                         }
                         Some(
-                            VariableSyntax::AssignmentPattern | VariableSyntax::Variable { .. },
+                            VariableSyntax::AssignmentPattern { .. }
+                            | VariableSyntax::Variable { .. },
                         )
                         | None => VariableReferenceKind::Variable,
                     };
@@ -928,12 +1057,22 @@ where
                 )
                 .into_result(),
 
-                Some(Referenced::ModuleName {
-                    module_name,
-                    module_alias,
-                    ..
-                }) => rename_module_alias(module, &lines, &params, &module_name, &module_alias)
-                    .into_result(),
+                Some(Referenced::ModuleName { module_name, .. }) => {
+                    rename_module_alias(module, &lines, &params, &module_name).into_result()
+                }
+
+                Some(Referenced::TypeVariable { location, name }) => {
+                    rename_type_variable(module, &lines, &params, location, name).into_result()
+                }
+
+                Some(Referenced::Label { owner, label, .. }) => rename_label(
+                    &params,
+                    owner,
+                    &label,
+                    this.compiler.project_compiler.get_importable_modules(),
+                    &this.compiler.sources,
+                )
+                .into_result(),
 
                 None => RenameOutcome::NoRenames.into_result(),
             })
@@ -966,7 +1105,7 @@ where
                 Some(VariableSyntax::Generated) => None,
                 Some(
                     VariableSyntax::LabelShorthand(_)
-                    | VariableSyntax::AssignmentPattern
+                    | VariableSyntax::AssignmentPattern { .. }
                     | VariableSyntax::Variable { .. },
                 )
                 | None => {
@@ -984,7 +1123,7 @@ where
                         reference_locations.push(lsp::Location {
                             uri: uri.clone(),
                             range: src_span_to_lsp_range(reference.location, &lines),
-                        })
+                        });
                     }
 
                     Some(reference_locations)
@@ -1015,12 +1154,7 @@ where
                     ))
                 }
             },
-            Some(Referenced::ModuleType {
-                module,
-                name,
-                location,
-                ..
-            }) if location.contains(byte_index) => match search_scope {
+            Some(Referenced::ModuleType { module, name, .. }) => match search_scope {
                 FindReferencesSearchScope::AllModules => Some(find_module_references(
                     module,
                     name,
@@ -1037,6 +1171,24 @@ where
                         source_module,
                         source_information,
                         ast::Layer::Type,
+                    ))
+                }
+            },
+            Some(Referenced::Label { owner, label, .. }) => match search_scope {
+                FindReferencesSearchScope::AllModules => Some(find_label_references(
+                    owner,
+                    label,
+                    self.compiler.project_compiler.get_importable_modules(),
+                    &self.compiler.sources,
+                )),
+                FindReferencesSearchScope::CurrentModule => {
+                    let source_information = self.compiler.get_source(&source_module.name)?;
+                    let source_module = self.compiler.get_module_interface(&source_module.name)?;
+                    Some(find_label_references_in_module(
+                        owner,
+                        label,
+                        source_module,
+                        source_information,
                     ))
                 }
             },
@@ -1071,6 +1223,36 @@ where
                         })
                         .collect()
                 }))
+        })
+    }
+
+    /// Triggers after the renaming of one or more `.gleam` files, updating any
+    /// imports to those modules.
+    pub fn rename_files(&mut self, renames: Vec<(Url, Url)>) -> Response<Option<WorkspaceEdit>> {
+        self.respond(|this| {
+            let mut changes = HashMap::new();
+
+            for (old_uri, new_uri) in renames {
+                let Some(old_name) = this.module_name_for_uri(&old_uri) else {
+                    continue;
+                };
+                let Some(new_name) = this.module_name_for_uri(&new_uri) else {
+                    continue;
+                };
+                rename_module_occurrences(
+                    old_name,
+                    new_name,
+                    this.compiler.project_compiler.get_importable_modules(),
+                    &this.compiler.sources,
+                    &mut changes,
+                );
+            }
+
+            Ok(Some(WorkspaceEdit {
+                changes: Some(changes),
+                document_changes: None,
+                change_annotations: None,
+            }))
         })
     }
 
@@ -1132,16 +1314,19 @@ where
                 Located::VariantConstructorDefinition(constructor) => {
                     Some(hover_for_constructor(constructor, lines, module))
                 }
-                Located::UnqualifiedImport(UnqualifiedImport {
-                    name,
-                    module: module_name,
-                    is_type,
-                    location,
-                }) => this
+                Located::UnqualifiedImport(
+                    import @ UnqualifiedImport {
+                        name,
+                        module: module_name,
+                        location,
+                        name_position: _,
+                        as_name: _,
+                    },
+                ) => this
                     .compiler
                     .get_module_interface(module_name.as_str())
                     .and_then(|module_interface| {
-                        if is_type {
+                        if import.is_type() {
                             module_interface.types.get(name).map(|constructor| {
                                 hover_for_annotation(
                                     *location,
@@ -1207,7 +1392,19 @@ Unused labelled fields:
                         range,
                     })
                 }
-                Located::StringPrefixPatternVariable { location, .. } => Some(
+                Located::StringPrefixPatternPrefixAlias {
+                    name_start_position,
+                    location,
+                    ..
+                } => {
+                    let name_location = SrcSpan::new(name_start_position, location.end);
+                    Some(hover_for_string_prefix_pattern_variable(
+                        name_location,
+                        &lines,
+                        module,
+                    ))
+                }
+                Located::StringPrefixPatternSuffix { location, .. } => Some(
                     hover_for_string_prefix_pattern_variable(location, &lines, module),
                 ),
                 Located::Expression {
@@ -1235,9 +1432,42 @@ Unused labelled fields:
                         module,
                     ))
                 }
-                Located::Label(location, type_) => {
-                    Some(hover_for_label(location, type_, lines, module))
+                Located::Label {
+                    location,
+                    field_type,
                 }
+                | Located::RecordLabelDefinition {
+                    location,
+                    field_type,
+                    ..
+                }
+                | Located::RecordLabelUsage {
+                    location,
+                    field_type,
+                    ..
+                }
+                | Located::FunctionLabelDefinition {
+                    location,
+                    field_type,
+                    ..
+                }
+                | Located::FunctionLabelUsage {
+                    location,
+                    field_type,
+                    ..
+                } => Some(hover_for_label(location, field_type, None, lines, module)),
+                Located::RecordAccessLabel {
+                    location,
+                    field_type,
+                    documentation,
+                    ..
+                } => Some(hover_for_label(
+                    location,
+                    field_type,
+                    documentation.as_ref(),
+                    lines,
+                    module,
+                )),
                 Located::ModuleName {
                     location,
                     module_name,
@@ -1250,6 +1480,8 @@ Unused labelled fields:
                 }
 
                 Located::ClauseGuard(guard) => Some(hover_for_clause_guard(guard, lines, module)),
+
+                Located::TypeVariable { .. } => None,
             })
         })
     }
@@ -1295,7 +1527,7 @@ Unused labelled fields:
         self.module_node_at_position(params, module)
     }
 
-    fn module_for_uri(&self, uri: &Url) -> Option<&Module> {
+    fn module_name_for_uri(&self, uri: &Url) -> Option<EcoString> {
         // The to_file_path method is available on these platforms
         #[cfg(any(unix, windows, target_os = "redox", target_os = "wasi"))]
         let path = uri.to_file_path().expect("URL file");
@@ -1309,12 +1541,22 @@ Unused labelled fields:
             .components()
             .skip(1)
             .map(|c| c.as_os_str().to_string_lossy());
-        let module_name: EcoString = Itertools::intersperse(components, "/".into())
+        let name = Itertools::intersperse(components, "/".into())
             .collect::<String>()
             .strip_suffix(".gleam")?
             .into();
+        Some(name)
+    }
 
+    fn module_for_uri(&self, uri: &Url) -> Option<&Module> {
+        let module_name = self.module_name_for_uri(uri)?;
         self.compiler.modules.get(&module_name)
+    }
+
+    #[cfg(test)]
+    pub fn path_for_module_name(&self, module_name: &str) -> Utf8PathBuf {
+        let src_directory = self.paths.src_directory();
+        src_directory.join(module_name).with_extension("gleam")
     }
 }
 
@@ -1373,6 +1615,77 @@ fn import_folding_spans(
     spans
 }
 
+fn comment_folding_spans(
+    comments: &[SrcSpan],
+    code: &str,
+    line_numbers: &LineNumbers,
+    comment_prefix: &str,
+) -> Vec<SrcSpan> {
+    let mut spans = vec![];
+    let comments = comments.iter();
+
+    let mut comments = comments.map(|span| {
+        let line = src_span_to_lsp_range(*span, line_numbers).start.line;
+        let start = line_numbers
+            .line_starts
+            .get(line as usize)
+            .copied()
+            .unwrap_or_default();
+        let end = line_numbers
+            .line_starts
+            .get(line as usize + 1)
+            .copied()
+            .map(|next_line_start| next_line_start.saturating_sub(1))
+            .unwrap_or(line_numbers.length);
+
+        // Find prefix (`//`, `///` or `////`), so we use start of the prefix
+        // as start of comment. This allows us to not fold comments before and
+        // after some code, like here:
+        // ```gleam
+        // // wibble
+        // // wobble
+        // wibble // wubble
+        // ```
+        let between = &code[start as usize..end as usize];
+        let start = start + between.find(comment_prefix).unwrap_or_default() as u32;
+        (start, line, end)
+    });
+
+    let Some((start, line, end)) = comments.next() else {
+        return spans;
+    };
+
+    let mut current_start = start;
+    let mut current_line = line;
+    let mut current_end = end;
+    let mut current_len = 1;
+
+    for (start, line, end) in comments {
+        let separated_by_blank_line = line > current_line + 1;
+        let between = &code[current_end as usize..start as usize];
+        let has_non_comments_between_between = between.chars().any(|char| !char.is_whitespace());
+
+        if separated_by_blank_line || has_non_comments_between_between {
+            if current_len > 1 {
+                spans.push(SrcSpan::new(current_start, current_end));
+            }
+            current_start = start;
+            current_end = end;
+            current_len = 1;
+        } else {
+            current_end = end;
+            current_len += 1;
+        }
+        current_line = line;
+    }
+
+    if current_len > 1 {
+        spans.push(SrcSpan::new(current_start, current_end));
+    }
+
+    spans
+}
+
 fn folding_range_for_span(
     span: SrcSpan,
     line_numbers: &LineNumbers,
@@ -1422,7 +1735,7 @@ fn custom_type_symbol(
                 // to be able to construct the 'DocumentSymbol' type, so
                 // we suppress the warning. We specify 'None' as specifying 'Some'
                 // is what is actually deprecated.
-                #[allow(deprecated)]
+                #[expect(deprecated)]
                 arguments.push(DocumentSymbol {
                     name: label.to_string(),
                     detail: Some(
@@ -1455,7 +1768,7 @@ fn custom_type_symbol(
             // to be able to construct the 'DocumentSymbol' type, so
             // we suppress the warning. We specify 'None' as specifying 'Some'
             // is what is actually deprecated.
-            #[allow(deprecated)]
+            #[expect(deprecated)]
             DocumentSymbol {
                 name: constructor.name.to_string(),
                 detail: None,
@@ -1494,7 +1807,7 @@ fn custom_type_symbol(
     // to be able to construct the 'DocumentSymbol' type, so
     // we suppress the warning. We specify 'None' as specifying 'Some'
     // is what is actually deprecated.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     DocumentSymbol {
         name: type_.name.to_string(),
         detail: None,
@@ -1608,11 +1921,15 @@ fn hover_for_annotation(
 fn hover_for_label(
     location: SrcSpan,
     type_: Arc<Type>,
+    documentation: Option<&EcoString>,
     line_numbers: LineNumbers,
     module: &Module,
 ) -> Hover {
     let type_ = Printer::new(&module.ast.names).print_type(&type_);
-    let contents = format!("```gleam\n{type_}\n```");
+    let contents = match documentation {
+        Some(documentation) => format!("```gleam\n{type_}\n```\n{documentation}"),
+        None => format!("```gleam\n{type_}\n```"),
+    };
     Hover {
         contents: Contents::MarkedString(MarkedString::String(contents)),
         range: Some(src_span_to_lsp_range(location, &line_numbers)),
@@ -2024,7 +2341,7 @@ fn code_action_fix_names(
                 new_text: correction.to_string(),
             };
 
-            CodeActionBuilder::new(format!("Rename to {correction}"))
+            CodeActionBuilder::new(&format!("Rename to {correction}"))
                 .kind(lsp_types::CodeActionKind::QuickFix)
                 .changes(uri.clone(), vec![edit])
                 .preferred(true)

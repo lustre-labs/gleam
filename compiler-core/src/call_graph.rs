@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2023 The Gleam contributors
+
 //! Graphs that represent the relationships between entities in a Gleam module,
 //! such as module functions or constants.
 
@@ -8,17 +11,18 @@ use crate::{
     Result,
     ast::{
         AssignName, AssignmentKind, BitArrayOption, BitArraySize, ClauseGuard, Constant, Pattern,
-        SrcSpan, Statement, UntypedClauseGuard, UntypedConstant, UntypedExpr, UntypedFunction,
+        Statement, UntypedClauseGuard, UntypedConstant, UntypedExpr, UntypedFunction,
         UntypedModuleConstant, UntypedPattern, UntypedStatement,
     },
     type_::Error,
 };
 use itertools::Itertools;
 use petgraph::{Directed, stable_graph::NodeIndex, stable_graph::StableGraph};
+use src_span::SrcSpan;
 
 #[derive(Debug, Default)]
 struct CallGraphBuilder<'a> {
-    names: im::HashMap<&'a str, Option<(NodeIndex, SrcSpan)>>,
+    names: imbl::HashMap<&'a str, Option<(NodeIndex, SrcSpan)>>,
     graph: StableGraph<(), (), Directed>,
     current_function: NodeIndex,
 }
@@ -170,10 +174,10 @@ impl<'a> CallGraphBuilder<'a> {
             Statement::Assert(assert) => {
                 self.expression(&assert.value);
                 if let Some(message) = &assert.message {
-                    self.expression(message)
+                    self.expression(message);
                 }
             }
-        };
+        }
     }
 
     fn expression(&mut self, expression: &'a UntypedExpr) {
@@ -182,13 +186,13 @@ impl<'a> CallGraphBuilder<'a> {
 
             UntypedExpr::Todo { message, .. } => {
                 if let Some(msg_expr) = message {
-                    self.expression(msg_expr)
+                    self.expression(msg_expr);
                 }
             }
 
             UntypedExpr::Panic { message, .. } => {
                 if let Some(msg_expr) = message {
-                    self.expression(msg_expr)
+                    self.expression(msg_expr);
                 }
             }
 
@@ -218,7 +222,7 @@ impl<'a> CallGraphBuilder<'a> {
                 }
             }
 
-            UntypedExpr::PipeLine { expressions } => {
+            UntypedExpr::Pipeline { expressions } => {
                 for expression in expressions {
                     self.expression(expression);
                 }
@@ -292,7 +296,7 @@ impl<'a> CallGraphBuilder<'a> {
                 let names = self.names.clone();
                 for argument in arguments {
                     if let Some(name) = argument.names.get_variable_name() {
-                        self.define(name)
+                        self.define(name);
                     }
                 }
                 self.statements(body);
@@ -465,7 +469,7 @@ impl<'a> CallGraphBuilder<'a> {
 
             Constant::Todo { message, .. } => {
                 if let Some(message) = message {
-                    self.constant(message)
+                    self.constant(message);
                 }
             }
 
@@ -513,7 +517,7 @@ impl<'a> CallGraphBuilder<'a> {
                 }
             }
 
-            Constant::StringConcatenation { left, right, .. } => {
+            Constant::BinaryOperator { left, right, .. } => {
                 self.constant(left);
                 self.constant(right);
             }

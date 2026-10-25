@@ -1,11 +1,14 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2019 The Gleam contributors
+
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use crate::ast::{self, SrcSpan};
+use crate::ast::{self};
 use crate::bit_array::UnsupportedOption;
 use crate::build::{Origin, Outcome, Runtime, Target};
-use crate::dependency::{PackageFetcher, ResolutionError};
+use crate::dependency::{PackageFetcher, ResolutionError, ResolutionFailure};
+use crate::derivation_tree::DerivationTreePrinter;
 use crate::diagnostic::{Diagnostic, ExtraLabel, Label, Location};
 
-use crate::derivation_tree::DerivationTreePrinter;
 use crate::parse::error::ParseErrorDetails;
 use crate::strings::{to_snake_case, to_upper_camel_case};
 use crate::type_::collapse_links;
@@ -21,9 +24,10 @@ use crate::{bit_array, diagnostic::Level, type_::UnifyErrorSituation};
 use ecow::EcoString;
 use hexpm::version::Version;
 use itertools::Itertools;
+use src_span::SrcSpan;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,7 +46,7 @@ pub mod tests;
 
 macro_rules! wrap_format {
     ($($tts:tt)*) => {
-        wrap(&format!($($tts)*))
+        crate::error::wrap(&format!($($tts)*))
     }
 }
 pub(crate) use wrap_format;
@@ -179,12 +183,12 @@ pub enum Error {
     #[error("cyclical package dependencies")]
     PackageCycle { packages: Vec<EcoString> },
 
-    #[error("{action:?} {path:?} failed: {err:?}")]
+    #[error("{action:?} {path:?} failed: {cause:?}")]
     FileIo {
         kind: FileKind,
         action: FileIoAction,
         path: Utf8PathBuf,
-        err: Option<String>,
+        cause: FileIoCause,
     },
 
     #[error("Non Utf-8 Path: {path}")]
@@ -192,6 +196,12 @@ pub enum Error {
 
     #[error("{error}")]
     GitInitialization { error: String },
+
+    #[error("Failed to send LSP message: {error}")]
+    LspMessageSendFailed { error: String },
+
+    #[error("Failed to receive LSP message: {error}")]
+    LspMessageReceiveFailed { error: String },
 
     #[error("io operation failed")]
     StandardIo {
@@ -309,8 +319,7 @@ file_names.iter().map(|x| x.as_str()).join(", "))]
     #[error("Could not find versions that satisfy dependency requirements")]
     DependencyResolutionNoSolution {
         root_package_name: EcoString,
-        derivation_tree:
-            Box<NeverEqual<pubgrub::DerivationTree<String, pubgrub::Ranges<Version>, String>>>,
+        derivation_tree: Box<NeverEqual<ResolutionFailure>>,
     },
 
     #[error("Dependency resolution failed: {0}")]
@@ -331,6 +340,13 @@ file_names.iter().map(|x| x.as_str()).join(", "))]
         package: String,
         source_1: String,
         source_2: String,
+    },
+
+    #[error("The path {path} does not exist in the git repository {repo} for package {package}")]
+    GitDependencyPathNotFound {
+        package: String,
+        path: String,
+        repo: String,
     },
 
     #[error("The package was missing required fields for publishing")]
@@ -409,7 +425,7 @@ file_names.iter().map(|x| x.as_str()).join(", "))]
     FailedToEncryptLocalHexApiKey { detail: String },
 
     #[error("Failed to decrypt local Hex API key")]
-    FailedToDecryptLocalHexApiKey { detail: String },
+    FailedToDecryptLocalHexApiKey,
 
     #[error("Cannot add a package with the same name as a dependency")]
     CannotAddSelfAsDependency { name: EcoString },
@@ -422,6 +438,24 @@ file_names.iter().map(|x| x.as_str()).join(", "))]
 
     #[error("{path} could not be added to the tarball as it is outside the project root")]
     TarPathOutsideOfProjectRoot { path: Utf8PathBuf },
+
+    #[error("could not create temp file: {error}")]
+    CouldNotCreateTempFile { error: String },
+
+    /// This happens when we try adding some packages as regular dependencies
+    /// (gleam add wibble wobble ...) but those are already listed in the dev
+    /// dependencies of the project!
+    #[error("these packages are already dev dependencies: {packages:?}")]
+    AddedDependenciesAreAlreadyDevDependencies { packages: Vec<EcoString> },
+
+    /// This happens when we try adding some packages as dev dependencies
+    /// (gleam add wibble wobble ... --dev) but those are already listed in the
+    /// dependencies of the project!
+    #[error("these packages are already dependencies: {packages:?}")]
+    AddedDevDependenciesAreAlreadyDependencies { packages: Vec<EcoString> },
+
+    #[error("the documentation page {path} is outside the package directory")]
+    DocumentationPageOutsidePackage { path: Utf8PathBuf },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -454,12 +488,6 @@ pub struct SmallVersion {
     patch: u8,
 }
 
-impl Display for SmallVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&format!("{}.{}.{}", self.major, self.minor, self.patch))
-    }
-}
-
 impl SmallVersion {
     pub fn from_hexpm(version: Version) -> Self {
         Self {
@@ -467,6 +495,10 @@ impl SmallVersion {
             minor: version.minor as u8,
             patch: version.patch as u8,
         }
+    }
+
+    pub fn to_semver_string(&self) -> String {
+        format!("{}.{}.{}", self.major, self.minor, self.patch)
     }
 }
 #[derive(Debug, Clone, Eq, PartialEq, Copy)]
@@ -536,6 +568,7 @@ impl Error {
             | hexpm::ApiError::Forbidden
             | hexpm::ApiError::NotReplacing
             | hexpm::ApiError::LateModification
+            | hexpm::ApiError::LateDeletion
             | hexpm::ApiError::OAuthTimeout
             | hexpm::ApiError::OAuthAccessDenied
             | hexpm::ApiError::ExpiredToken => Self::Hex(error.to_string()),
@@ -571,7 +604,7 @@ impl Error {
         match error {
             ResolutionError::NoSolution(derivation_tree) => Self::DependencyResolutionNoSolution {
                 root_package_name,
-                derivation_tree: Box::new(NeverEqual(derivation_tree)),
+                derivation_tree: Box::new(NeverEqual(ResolutionFailure(derivation_tree))),
             },
 
             ResolutionError::ErrorRetrievingDependencies {
@@ -682,11 +715,13 @@ impl StandardIoAction {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum FileIoAction {
-    Link,
+    Link(Utf8PathBuf),
     Open,
-    Copy,
+    // Path is `Option` here since there are some cases where we do not have
+    // destination, like when writing ZIP archives
+    Copy(Option<Utf8PathBuf>),
     Read,
     Parse,
     Delete,
@@ -697,14 +732,16 @@ pub enum FileIoAction {
     UpdatePermissions,
     FindParent,
     ReadMetadata,
+    Lock,
 }
 
 impl FileIoAction {
     fn text(&self) -> &'static str {
         match self {
-            FileIoAction::Link => "link",
+            FileIoAction::Link(..) => "link",
             FileIoAction::Open => "open",
-            FileIoAction::Copy => "copy",
+            FileIoAction::Lock => "lock",
+            FileIoAction::Copy(..) => "copy",
             FileIoAction::Read => "read",
             FileIoAction::Parse => "parse",
             FileIoAction::Delete => "delete",
@@ -716,6 +753,59 @@ impl FileIoAction {
             FileIoAction::UpdatePermissions => "update permissions of",
             FileIoAction::ReadMetadata => "read metadata of",
         }
+    }
+
+    fn is_link(&self) -> bool {
+        match self {
+            FileIoAction::Link(..) => true,
+
+            FileIoAction::Open
+            | FileIoAction::Copy(..)
+            | FileIoAction::Read
+            | FileIoAction::Lock
+            | FileIoAction::Parse
+            | FileIoAction::Delete
+            | FileIoAction::Create
+            | FileIoAction::WriteTo
+            | FileIoAction::Canonicalise
+            | FileIoAction::UpdatePermissions
+            | FileIoAction::FindParent
+            | FileIoAction::ReadMetadata => false,
+        }
+    }
+
+    /// Returns a destination path of action, if any
+    fn destination(&self) -> Option<&Utf8PathBuf> {
+        match self {
+            FileIoAction::Link(destination) | FileIoAction::Copy(Some(destination)) => {
+                Some(destination)
+            }
+
+            FileIoAction::Open
+            | FileIoAction::Read
+            | FileIoAction::Lock
+            | FileIoAction::Parse
+            | FileIoAction::Delete
+            | FileIoAction::Create
+            | FileIoAction::WriteTo
+            | FileIoAction::Canonicalise
+            | FileIoAction::UpdatePermissions
+            | FileIoAction::FindParent
+            | FileIoAction::ReadMetadata
+            | FileIoAction::Copy(None) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileIoCause {
+    Other(String),
+    CacheMetadataFormatIncorrect,
+}
+
+impl FileIoCause {
+    pub fn std_io(error: std::io::Error) -> Self {
+        Self::Other(error.to_string())
     }
 }
 
@@ -871,7 +961,9 @@ fn edit_distance_with_substrings(a: &str, b: &str, limit: usize) -> Option<usize
     (score <= limit).then_some(score)
 }
 
-fn did_you_mean(name: &str, options: &[EcoString]) -> Option<String> {
+/// Returns a "Did you mean ...?" suggestion using the string from `options` that's most similar to
+/// `name`.
+pub fn did_you_mean(name: &str, options: &[EcoString]) -> Option<String> {
     // If only one option is given, return that option.
     // This seems to solve the `unknown_variable_3` test.
     if options.len() == 1 {
@@ -1228,29 +1320,29 @@ target, so it cannot be run.",
                 location: None,
             }],
 
-            Error::OutputFilesAlreadyExist { file_names } => vec![Diagnostic {
-                title: format!(
-                    "{} already exist{} in target directory",
-                    if file_names.len() == 1 {
-                        "File"
-                    } else {
-                        "Files"
-                    },
-                    if file_names.len() == 1 { "" } else { "s" }
-                ),
-                text: format!(
-                    "{}
-If you want to overwrite these files, delete them and run the command again.
-",
-                    file_names
-                        .iter()
-                        .map(|name| format!("  - {}", name.as_str()))
-                        .join("\n")
-                ),
-                level: Level::Error,
-                hint: None,
-                location: None,
-            }],
+            Error::OutputFilesAlreadyExist { file_names } => {
+                let (plural, conjugation, text_files, text_pronoun) = if file_names.len() == 1 {
+                    ("", "s", "this file", "it")
+                } else {
+                    ("s", "", "these files", "them")
+                };
+                let file_list = file_names
+                    .iter()
+                    .map(|name| format!("  - {}", name.as_str()))
+                    .join("\n");
+                vec![Diagnostic {
+                    title: format!("File{plural} already exist{conjugation} in target directory"),
+                    text: format!(
+                        "{file_list}
+
+If you want to overwrite {text_files}, delete {text_pronoun} and run the command again.
+"
+                    ),
+                    level: Level::Error,
+                    hint: None,
+                    location: None,
+                }]
+            }
 
             Error::RemovedPackagesNotExist { packages } => vec![Diagnostic {
                 title: "Package not found".into(),
@@ -1329,22 +1421,27 @@ Please remove them and try again.
             Error::CannotPublishWrongVersion {
                 minimum_required_version,
                 wrongfully_allowed_version,
-            } => vec![Diagnostic {
-                title: "Cannot publish package with wrong Gleam version range".into(),
-                text: wrap(&format!(
-                    "Your package uses features that require at least v{minimum_required_version}.
+            } => {
+                let minimum_required_version = minimum_required_version.to_semver_string();
+                let wrongfully_allowed_version = wrongfully_allowed_version.to_semver_string();
+
+                vec![Diagnostic {
+                    title: "Cannot publish package with wrong Gleam version range".into(),
+                    text: wrap(&format!(
+                        "Your package uses features that require at least v{minimum_required_version}.
 But the Gleam version range specified in your `gleam.toml` would allow this \
 code to run on an earlier version like v{wrongfully_allowed_version}, \
 resulting in compilation errors!"
-                )),
-                level: Level::Error,
-                hint: Some(format!(
-                    "Remove the version constraint from your `gleam.toml` or update it to be:
+                    )),
+                    level: Level::Error,
+                    hint: Some(format!(
+                        "Remove the version constraint from your `gleam.toml` or update it to be:
 
     gleam = \">= {minimum_required_version}\""
-                )),
-                location: None,
-            }],
+                    )),
+                    location: None,
+                }]
+            }
 
             Error::CannotPublishLeakedInternalType { unfinished } => vec![Diagnostic {
                 title: "Cannot publish unfinished code".into(),
@@ -1422,7 +1519,7 @@ your app.src file \"{app_ver}\"."
                         }
                         match program.as_str() {
                             "erl" | "erlc" | "escript" => {
-                                text.push_str(&brew_install("Erlang", "erlang"))
+                                text.push_str(&brew_install("Erlang", "erlang"));
                             }
                             "rebar3" => text.push_str(&brew_install("Rebar3", "rebar3")),
                             "deno" => text.push_str(&brew_install("Deno", "deno")),
@@ -1773,29 +1870,50 @@ Erlang modules must have unique names regardless of the subfolders where their
                 }]
             }
 
+            Error::CouldNotCreateTempFile { error } => vec![Diagnostic {
+                title: "File IO failure".into(),
+                text: wrap_format!("Could not create temporary file:\n\n\t{error}"),
+                level: Level::Error,
+                location: None,
+                hint: None,
+            }],
+
             Error::FileIo {
                 kind,
                 action,
                 path,
-                err,
+                cause,
             } => {
-                let err = match err {
-                    Some(e) => {
-                        format!("\nThe error message from the file IO library was:\n\n    {e}\n")
-                    }
-                    None => "".into(),
-                };
                 let mut text = format!(
                     "An error occurred while trying to {} this {}:
 
-    {}
-{}",
+    {}",
                     action.text(),
                     kind.text(),
-                    path,
-                    err,
+                    path
                 );
-                if cfg!(target_family = "windows") && action == &FileIoAction::Link {
+                if let Some(destination) = action.destination() {
+                    text.push_str("\n\nTo:\n\n    ");
+                    text.push_str(destination.as_str());
+                }
+                match cause {
+                    FileIoCause::Other(error) => {
+                        text.push_str(
+                            "\n\nThe error message from the file IO library was:\n\n    ",
+                        );
+                        text.push_str(error.as_str());
+                    }
+                    FileIoCause::CacheMetadataFormatIncorrect => text.push_str(
+                        "
+
+The data in this file was not in the expected format, so it could
+not be understood by the compiler.
+
+This can happen if the data file was created with a different
+version of Gleam, or if the files have been corrupted in some way.",
+                    ),
+                };
+                if cfg!(target_family = "windows") && action.is_link() {
                     text.push_str("
 
 Windows does not support symbolic links without developer mode
@@ -1829,17 +1947,19 @@ The error from the encryption library was:
                 }]
             }
 
-            Error::FailedToDecryptLocalHexApiKey { detail } => {
+            Error::FailedToDecryptLocalHexApiKey => {
                 let text = wrap_format!(
                     "Unable to decrypt the local Hex API key with the given password.
-The error from the encryption library was:
-
-    {detail}"
+Did you make a typo? Please try again."
                 );
                 vec![Diagnostic {
                     title: "Failed to decrypt local Hex API key".into(),
                     text,
-                    hint: None,
+                    hint: Some(
+                        "If you have forgotten your local password you can create a new one
+with `gleam hex authenticate`."
+                            .into(),
+                    ),
                     level: Level::Error,
                     location: None,
                 }]
@@ -1867,6 +1987,42 @@ The error from the encryption library was:
                 );
                 vec![Diagnostic {
                     title: "Failed to initialize git repository".into(),
+                    text,
+                    hint: None,
+                    level: Level::Error,
+                    location: None,
+                }]
+            }
+
+            Error::LspMessageSendFailed { error } => {
+                let text = wrap_format!(
+                    "An error occurred when the Gleam language server \
+attempted to send a message to the client:
+
+    {error}
+
+Is your editor still running and connected to the language server?"
+                );
+                vec![Diagnostic {
+                    title: "Failed to send LSP message".into(),
+                    text,
+                    hint: None,
+                    level: Level::Error,
+                    location: None,
+                }]
+            }
+
+            Error::LspMessageReceiveFailed { error } => {
+                let text = wrap_format!(
+                    "An error occurred when the Gleam language server \
+attempted to receive a message from the client:
+
+    {error}
+
+Is your editor still running and connected to the language server?"
+                );
+                vec![Diagnostic {
+                    title: "Failed to send LSP message".into(),
                     text,
                     hint: None,
                     level: Level::Error,
@@ -2205,6 +2361,25 @@ manifest.toml and a version range specified in gleam.toml:
                 }]
             }
 
+            Error::GitDependencyPathNotFound {
+                package,
+                path,
+                repo,
+            } => {
+                let text = format!(
+                    "The path `{path}` does not exist in the git repository `{repo}` \
+for package `{package}`."
+                );
+
+                vec![Diagnostic {
+                    title: "Git dependency path not found".into(),
+                    text,
+                    hint: None,
+                    location: None,
+                    level: Level::Error,
+                }]
+            }
+
             Error::DuplicateDependency(name) => {
                 let text = format!(
                     "The package `{name}` is specified in both the dependencies and
@@ -2421,6 +2596,106 @@ add `gleam add {name}` in this project."
                 location: None,
                 hint: None,
             }],
+
+            Error::AddedDependenciesAreAlreadyDevDependencies { packages } => {
+                match packages.as_slice() {
+                    [package] => vec![Diagnostic {
+                        title: "Package is already a dev dependency".into(),
+                        text: wrap_format!(
+                            "{package} is already a development dependency of this project."
+                        ),
+                        level: Level::Error,
+                        location: None,
+                        hint: Some(
+                            "If you want to use this package as a regular \
+dependency, you can move it to the `dependencies` section of this project's \
+`gleam.toml`."
+                                .into(),
+                        ),
+                    }],
+                    packages => vec![Diagnostic {
+                        title: "Packages are already dev dependencies".into(),
+                        text: wrap_format!(
+                            "{} are already development dependencies of this project.",
+                            comma_separated_list(packages)
+                        ),
+                        level: Level::Error,
+                        location: None,
+                        hint: Some(
+                            "If you want to use these packages as regular \
+dependencies, you can move them to the `dependencies` section of this project's \
+`gleam.toml`."
+                                .into(),
+                        ),
+                    }],
+                }
+            }
+
+            Error::AddedDevDependenciesAreAlreadyDependencies { packages } => {
+                match packages.as_slice() {
+                    [package] => vec![Diagnostic {
+                        title: "Package is already a dependency".into(),
+                        text: wrap_format!("{package} is already a dependency of this project."),
+                        level: Level::Error,
+                        location: None,
+                        hint: Some(
+                            "If you want to use this package as a development \
+dependency only, you can move it to the `dev_dependencies` section of this \
+project's `gleam.toml`."
+                                .into(),
+                        ),
+                    }],
+                    packages => vec![Diagnostic {
+                        title: "Packages are already dependencies".into(),
+                        text: wrap_format!(
+                            "{} are already dependencies of this project.",
+                            comma_separated_list(packages)
+                        ),
+                        level: Level::Error,
+                        location: None,
+                        hint: Some(
+                            "If you want to use these packages as development \
+dependencies only, you can move them to the `dev_dependencies` section of this \
+project's `gleam.toml`."
+                                .into(),
+                        ),
+                    }],
+                }
+            }
+
+            Error::DocumentationPageOutsidePackage { path } => {
+                let text = wrap_format!(
+                    "This documentation page source path falls outside \
+the package directory, so it could not be read.
+
+    {path}
+
+All documentation pages files must be inside the package itself."
+                );
+                vec![Diagnostic {
+                    title: "Documentation page outside package directory".into(),
+                    text,
+                    level: Level::Error,
+                    location: None,
+                    hint: None,
+                }]
+            }
+        }
+    }
+}
+
+/// Turns a list of strings into a comma separated list of items with a final
+/// "and":
+/// - "wibble"
+/// - "wibble and wobble"
+/// - "wibble, wobble, and woo"
+fn comma_separated_list(items: &[EcoString]) -> String {
+    match items {
+        [] => String::new(),
+        [first, second] => format!("{first} and {second}"),
+        [first, ..] => {
+            let (last, items) = items.split_last().unwrap_or((first, &[]));
+            format!("{}, and {last}", items.iter().join(", "))
         }
     }
 }
@@ -3338,6 +3613,7 @@ a label or use a record constructor.",
             location,
             name,
             hint,
+            ..
         } => {
             let label_text = match hint {
                 UnknownTypeHint::AlternativeTypes(types) => did_you_mean(name, types),
@@ -3357,7 +3633,7 @@ but no type in scope with that name."
                     text.push_str(hint.as_str());
                 }
                 UnknownTypeHint::AlternativeTypes(_) => {}
-            };
+            }
 
             Diagnostic {
                 title: "Unknown type".into(),
@@ -3426,9 +3702,18 @@ but no type in scope with that name."
                     // If there are some suggestions about public values in imported
                     // modules put a "did you mean" text after the main message
                     if !possible_modules.is_empty() {
-                        text.push_str("\nDid you mean one of these:\n\n");
+                        let message = if possible_modules.len() == 1 {
+                            "\nDid you mean:\n\n"
+                        } else {
+                            "\nDid you mean one of these:\n\n"
+                        };
+                        text.push_str(message);
                         for module_name in possible_modules {
-                            text.push_str(&format!("  - {module_name}.{name}\n"))
+                            text.push_str("  - ");
+                            text.push_str(module_name);
+                            text.push('.');
+                            text.push_str(name);
+                            text.push('\n');
                         }
                     }
 
@@ -3628,10 +3913,15 @@ to variables, pass them to functions, or anything else that you would do with a 
 but this pattern matches {given}.
 Each clause must have a pattern for every subject value.",
             );
+            let hint = if *expected == 1 {
+                Some("Did you mean to match on alternative patterns using `|`?".into())
+            } else {
+                None
+            };
             Diagnostic {
                 title: "Incorrect number of patterns".into(),
                 text,
-                hint: None,
+                hint,
                 level: Level::Error,
                 location: Some(Location {
                     label: Label {
@@ -4539,19 +4829,18 @@ here takes {expected_string}.\n"
                     text.push_str(
                         "The only argument that was supplied is \
 the `use` callback function.\n",
-                    )
+                    );
                 } else {
-                    text.push_str(&format!(
-                        "You supplied {supplied_arguments_string} \
-and the final one is the `use` callback function.\n"
-                    ));
+                    text.push_str("You supplied ");
+                    text.push_str(&supplied_arguments_string);
+                    text.push_str(" and the final one is the `use` callback function.\n");
                 }
             } else {
                 text.push_str(
                     "All the arguments have already been supplied, \
 so it cannot take the `use` callback function as a final argument.\n",
-                )
-            };
+                );
+            }
 
             text.push_str("\nSee: https://tour.gleam.run/advanced-features/use/");
 
@@ -4974,6 +5263,68 @@ Be sure to finish it before running your program.",
                 extra_labels: vec![],
             }),
         },
+        TypeError::InvalidConstantBinaryOperator {
+            operator_start,
+            operator,
+        } => Diagnostic {
+            title: "Unsupported operator in constant expression".into(),
+            text: wrap("This operator is currently not supported in constants."),
+            hint: None,
+            level: Level::Error,
+            location: Some(Location {
+                label: Label {
+                    text: None,
+                    span: SrcSpan::new(*operator_start, operator_start + operator.size()),
+                },
+                path: path.clone(),
+                src: src.clone(),
+                extra_labels: vec![],
+            }),
+        },
+        TypeError::PrivateValueUse {
+            location,
+            name,
+            module_name,
+        } => Diagnostic {
+            title: "Use of private value".into(),
+            text: wrap_format!(
+                "`{module_name}` does define `{name}`, but it is private \
+and cannot be accessed by other modules."
+            ),
+            hint: None,
+            level: Level::Error,
+            location: Some(Location {
+                label: Label {
+                    text: None,
+                    span: *location,
+                },
+                path: path.clone(),
+                src: src.clone(),
+                extra_labels: vec![],
+            }),
+        },
+        TypeError::PrivateTypeUse {
+            location,
+            name,
+            module_name,
+        } => Diagnostic {
+            title: "Use of private type".into(),
+            text: wrap_format!(
+                "`{module_name}` does define `{name}`, but it is private \
+and cannot be accessed by other modules."
+            ),
+            hint: None,
+            level: Level::Error,
+            location: Some(Location {
+                label: Label {
+                    text: None,
+                    span: *location,
+                },
+                path: path.clone(),
+                src: src.clone(),
+                extra_labels: vec![],
+            }),
+        },
     })
 }
 
@@ -5093,9 +5444,12 @@ fn hint_wrap_value_in_result(expected: &Arc<Type>, given: &Arc<Type>) -> Option<
     let expected = collapse_links(expected.clone());
     let (expected_ok_type, expected_error_type) = expected.result_types()?;
 
-    if given.same_as(expected_ok_type.as_ref()) {
+    // Unbound type variables are trivially matched by `same_as` to any other type,
+    // leading to confusing hints. Any `given` type could match one of the `expected`
+    // type variables, leading to false positives for the wrap hint.
+    if !expected_ok_type.is_unbound() && given.same_as(expected_ok_type.as_ref()) {
         Some("Did you mean to wrap this in an `Ok`?".into())
-    } else if given.same_as(expected_error_type.as_ref()) {
+    } else if !expected_error_type.is_unbound() && given.same_as(expected_error_type.as_ref()) {
         Some("Did you mean to wrap this in an `Error`?".into())
     } else {
         None
@@ -5141,7 +5495,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<Cow<'_, str>> {
                 let mut new_lines = break_line(line, width);
                 lines.append(&mut new_lines);
             }
-        };
+        }
     }
 
     lines
@@ -5197,12 +5551,14 @@ fn break_line(line: &str, width: usize) -> Vec<Cow<'_, str>> {
 // breaks word into n lines based on width. Returns list of new lines and remainder
 fn break_word(word: &str, width: usize) -> (Vec<Cow<'_, str>>, &str) {
     let mut new_lines: Vec<Cow<'_, str>> = Vec::new();
-    let (first, mut remainder) = word.split_at(width);
+    // Split on a char boundary so a multi-byte UTF-8 char straddling `width`
+    // doesn't cause a panic.
+    let (first, mut remainder) = word.split_at(word.floor_char_boundary(width));
     new_lines.push(Cow::from(first));
 
     // split remainder until it's small enough
     while remainder.len() > width {
-        let (first, second) = remainder.split_at(width);
+        let (first, second) = remainder.split_at(remainder.floor_char_boundary(width));
         new_lines.push(Cow::from(first));
         remainder = second;
     }

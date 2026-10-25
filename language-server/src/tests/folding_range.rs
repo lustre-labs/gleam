@@ -1,4 +1,9 @@
-use lsp_types::{FoldingRange, FoldingRangeKind, FoldingRangeParams};
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Gleam contributors
+
+use lsp_types::{
+    FoldingRange, FoldingRangeKind, FoldingRangeParams, PartialResultParams, WorkDoneProgressParams,
+};
 
 use super::*;
 
@@ -6,8 +11,8 @@ fn folding_ranges(tester: TestProject<'_>) -> Vec<FoldingRange> {
     tester.at(Position::default(), |engine, param, _| {
         let params = FoldingRangeParams {
             text_document: param.text_document,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
         };
         let response = engine.folding_range(params);
 
@@ -235,5 +240,72 @@ pub fn two() { 2 }
 pub fn three() {
   3
 }"
+    );
+}
+
+#[test]
+fn folds_for_comments() {
+    assert_folding!(
+        "
+//// This is very useful module.
+//// It can be used to wibble, wobble, and to wubble
+
+/// Function to wibble.
+///
+/// Not that it wobbles when wubble is true
+fn wibble() {
+  // We use this to wibble.
+  // Actually we could use wobble, would probably
+  // use wubble some time later
+  todo
+}
+"
+    );
+}
+
+#[test]
+fn folds_for_comments_breaked_with_code() {
+    assert_folding!(
+        "
+fn wibble() {
+  // Wibble comment
+  // Wobble comment
+  todo // ToDo comment
+
+  // Wubble comment
+}
+"
+    );
+}
+
+#[test]
+fn doesnt_fold_single_line_comments() {
+    assert_folding!(
+        "
+//// This is very useful module
+
+/// This is function for wibbling
+fn wibble() {
+  // Useful comment
+  todo
+}
+"
+    );
+}
+
+#[test]
+fn doesnt_fold_separated_comment_blocks() {
+    assert_folding!(
+        "
+fn wibble() {
+  // Useful comment
+  // Another useful comment
+
+  // Yet another useful comment
+  // Last useful comment
+
+  todo
+}
+"
     );
 }

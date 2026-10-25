@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 //! Seriaisation and deserialisation of Gleam compiler metadata into binary files
 //! using serde.
 
@@ -19,16 +22,15 @@ use crate::{
     uid::UniqueIdGenerator,
 };
 
-pub fn encode(module: &ModuleInterface) -> Result<Vec<u8>, bincode::error::EncodeError> {
-    bincode::serde::encode_to_vec(module, bincode::config::legacy())
+pub fn encode(module: &ModuleInterface) -> Result<Vec<u8>, bitcode::Error> {
+    bitcode::serialize(module)
 }
 
-pub fn decode(
-    bytes: &[u8],
-    ids: UniqueIdGenerator,
-) -> Result<ModuleInterface, bincode::error::DecodeError> {
-    bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
-        .map(|(module, _)| remap_type_variable_ids(module, ids))
+pub fn decode(bytes: &[u8], ids: UniqueIdGenerator) -> Option<ModuleInterface> {
+    match bitcode::deserialize(bytes) {
+        Ok(module) => Some(remap_type_variable_ids(module, ids)),
+        Err(_) => None,
+    }
 }
 
 fn remap_type_variable_ids(module: ModuleInterface, ids: UniqueIdGenerator) -> ModuleInterface {
@@ -66,7 +68,6 @@ impl RemapIds {
             documentation,
             contains_echo,
             references,
-            inline_functions,
         } = module;
 
         let types = types
@@ -107,7 +108,6 @@ impl RemapIds {
             documentation,
             contains_echo,
             references,
-            inline_functions,
         }
     }
 
@@ -171,6 +171,7 @@ impl RemapIds {
             name,
             parameters,
             documentation,
+            deprecation,
         } = variant;
 
         let parameters = parameters
@@ -192,6 +193,7 @@ impl RemapIds {
             name,
             parameters,
             documentation,
+            deprecation,
         }
     }
 
@@ -332,6 +334,7 @@ impl RemapIds {
             },
             Constant::Record {
                 location,
+                arguments_start_position,
                 module,
                 name,
                 arguments,
@@ -340,6 +343,7 @@ impl RemapIds {
                 record_constructor,
             } => Constant::Record {
                 location,
+                arguments_start_position,
                 module,
                 name,
                 arguments: arguments.map(|arguments| {
@@ -425,12 +429,18 @@ impl RemapIds {
                     .map(|constructor| Box::new(self.value_constructor(*constructor))),
                 type_: self.type_(type_),
             },
-            Constant::StringConcatenation {
+            Constant::BinaryOperator {
                 location,
+                operator_start,
                 left,
                 right,
-            } => Constant::StringConcatenation {
+                operator,
+                type_,
+            } => Constant::BinaryOperator {
                 location,
+                operator_start,
+                operator,
+                type_,
                 left: Box::new(self.constant(*left)),
                 right: Box::new(self.constant(*right)),
             },

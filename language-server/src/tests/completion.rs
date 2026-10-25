@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2023 The Gleam contributors
+
 use insta::assert_debug_snapshot;
 use itertools::Itertools;
 use lsp_types::{CompletionItem, Position};
@@ -98,7 +101,7 @@ fn format_completion_results(completions: Vec<CompletionItem>) -> EcoString {
         kind,
         detail,
         documentation,
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         deprecated,
         preselect,
         sort_text,
@@ -2692,4 +2695,98 @@ pub type Wibble {
         TestProject::for_source(code).add_module("dep", dep),
         Position::new(3, 20)
     );
+}
+
+#[test]
+fn _completions_for_deprecated_types_in_dep() {
+    let code = "
+import wibble
+
+pub fn wobble() -> wibble.Wobble {
+  todo
+}
+";
+    let dep = "pub type Wobble";
+
+    assert_apply_completion!(
+        TestProject::for_source(code).add_module("wibble", dep),
+        "wibble.Wobble",
+        Position::new(3, 25)
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/5937
+#[test]
+fn completions_for_imported_internal_record_fields_in_same_package() {
+    let code = "
+import mod
+
+fn fun(wibble: mod.Wibble) {
+  wibble.
+  //     ^ `mod` is in the same package so we expect completions here, even though
+  //       `Wibble` is internal.
+}
+";
+    let r#mod = "
+@internal
+pub type Wibble {
+  Wibble(wibble: String, wobble: Int)
+}
+";
+
+    assert_completion!(
+        TestProject::for_source(code).add_module("mod", r#mod),
+        Position::new(4, 9)
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/6142
+#[test]
+fn completions_for_left_side_of_string_prefix_pattern() {
+    let code = r#"
+pub fn go(wibble) {
+  case wibble {
+    "Hello, " as hello <> name -> h
+    _ -> "unknown"
+  }
+}
+"#;
+    assert_completion!(TestProject::for_source(code), Position::new(3, 35));
+}
+
+// https://github.com/gleam-lang/gleam/issues/6167
+#[test]
+fn completions_for_an_unqualified_import_without_braces() {
+    let code = "import dep.";
+    let dep = "
+pub const wibble = \"wibble\"
+
+pub fn wobble() {
+  todo
+}
+
+pub type Wibble {
+  Wibble
+}";
+
+    let position = Position::new(0, 11);
+    let tester = TestProject::for_source("import dep").add_module("dep", dep);
+    let mut io = LanguageServerTestIO::new();
+    let mut engine = tester.build_engine(&mut io);
+    // Pass a valid source to compile once
+    _ = io.src_module("app", tester.src);
+    let _ = engine.compile_please();
+    // Update source to the one we want to test
+    _ = io.src_module("app", code);
+    let param = tester.build_path(position);
+    let response = engine.completion(param, code.into());
+
+    let mut completions = response.result.unwrap().unwrap_or_default();
+    completions.sort_by(|a, b| a.label.cmp(&b.label));
+    let output = format!(
+        "{}\n\n----- Completion content -----\n{}",
+        show_complete(code, position),
+        format_completion_results(completions)
+    );
+    insta::assert_snapshot!(insta::internals::AutoName, output, code);
 }

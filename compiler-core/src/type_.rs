@@ -1,7 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2018 The Gleam contributors
+
+pub(crate) mod constant;
 pub(crate) mod environment;
 pub mod error;
 pub(crate) mod expression;
 pub(crate) mod fields;
+pub(crate) mod guard;
 pub(crate) mod hydrator;
 pub(crate) mod pattern;
 pub(crate) mod pipe;
@@ -25,19 +30,18 @@ use printer::Names;
 use crate::{
     ast::{
         ArgNames, BitArraySegment, CallArg, Constant, DefinitionLocation, Pattern, Publicity,
-        SrcSpan, TypedConstant, TypedExpr, TypedPattern, TypedPatternBitArraySegment,
-        UntypedMultiPattern, UntypedPattern, UntypedRecordUpdateArg,
+        TypedConstant, TypedExpr, TypedPattern, TypedPatternBitArraySegment, UntypedMultiPattern,
+        UntypedPattern, UntypedRecordUpdateArg,
     },
     bit_array,
     build::{Origin, Target},
-    inline::InlinableFunction,
-    line_numbers::LineNumbers,
-    reference::ReferenceMap,
+    reference::{LabelDefinition, LabelKey, LabelReference, ModuleNameReference, ReferenceMap},
     type_::expression::Implementations,
 };
 use error::*;
 use hydrator::Hydrator;
 use itertools::Itertools;
+use src_span::{LineNumbers, SrcSpan};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -351,6 +355,19 @@ impl Type {
                 ..
             } => Some((module.clone(), name.clone(), arguments.clone())),
             Self::Var { type_ } => type_.borrow().named_type_information(),
+            Self::Fn { .. } | Self::Tuple { .. } => None,
+        }
+    }
+
+    pub fn named_type_name_and_package(&self) -> Option<(EcoString, EcoString, EcoString)> {
+        match self {
+            Self::Named {
+                package,
+                module,
+                name,
+                ..
+            } => Some((package.clone(), module.clone(), name.clone())),
+            Self::Var { type_ } => type_.borrow().named_type_name_and_package(),
             Self::Fn { .. } | Self::Tuple { .. } => None,
         }
     }
@@ -922,7 +939,7 @@ pub enum ModuleValueConstructor {
         ///     pub fn wibble() { Nil }
         ///
         /// This function has module "themodule" and name "wibble"
-        /// and erlang external "other" and "whoop".
+        /// and Erlang external "other" and "whoop".
         ///     @external(erlang, "other", "whoop")
         ///     pub fn wibble() -> Nil
         ///
@@ -1021,8 +1038,6 @@ pub struct ModuleInterface {
     /// Wether there's any echo in the module.
     pub contains_echo: bool,
     pub references: References,
-    /// Functions which can be inlined
-    pub inline_functions: HashMap<EcoString, InlinableFunction>,
 }
 
 impl ModuleInterface {
@@ -1040,6 +1055,9 @@ pub struct References {
     pub imported_modules: HashSet<EcoString>,
     pub value_references: ReferenceMap,
     pub type_references: ReferenceMap,
+    pub module_references: HashMap<EcoString, Vec<ModuleNameReference>>,
+    pub label_references: HashMap<LabelKey, Vec<LabelReference>>,
+    pub label_definitions: HashMap<LabelKey, Vec<LabelDefinition>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1108,6 +1126,7 @@ pub struct TypeValueConstructor {
     pub name: EcoString,
     pub parameters: Vec<TypeValueConstructorField>,
     pub documentation: Option<EcoString>,
+    pub deprecation: Deprecation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1420,6 +1439,13 @@ impl TypeVar {
         }
     }
 
+    pub fn named_type_name_and_package(&self) -> Option<(EcoString, EcoString, EcoString)> {
+        match self {
+            Self::Link { type_ } => type_.named_type_name_and_package(),
+            Self::Unbound { .. } | Self::Generic { .. } => None,
+        }
+    }
+
     pub fn named_type_information(&self) -> Option<(EcoString, EcoString, Vec<Arc<Type>>)> {
         match self {
             Self::Link { type_ } => type_.named_type_information(),
@@ -1636,7 +1662,7 @@ fn unify_unbound_type(type_: &Type, own_id: u64) -> Result<(), UnifyError> {
     match type_ {
         Type::Named { arguments, .. } => {
             for argument in arguments {
-                unify_unbound_type(argument, own_id)?
+                unify_unbound_type(argument, own_id)?;
             }
             Ok(())
         }
@@ -1650,7 +1676,7 @@ fn unify_unbound_type(type_: &Type, own_id: u64) -> Result<(), UnifyError> {
 
         Type::Tuple { elements, .. } => {
             for element in elements {
-                unify_unbound_type(element, own_id)?
+                unify_unbound_type(element, own_id)?;
             }
             Ok(())
         }

@@ -1,10 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 use std::sync::OnceLock;
 
 use camino::Utf8PathBuf;
 use ecow::EcoString;
 use gleam_core::{
     analyse::TargetSupport,
-    build::{Built, Codegen, Compile, Mode, NullTelemetry, Options, Runtime, Target, Telemetry},
+    build::{
+        Built, Codegen, Compile, ErlangOutput, Mode, NullTelemetry, Options, Runtime, Target,
+        Telemetry,
+    },
     config::{DenoFlag, PackageConfig},
     error::Error,
     io::{Command, CommandExecutor, Stdio},
@@ -12,6 +18,7 @@ use gleam_core::{
     type_::ModuleFunction,
     version::COMPILER_VERSION,
 };
+use regex::Regex;
 
 use crate::{config::PackageKind, fs::ProjectIO};
 
@@ -31,7 +38,7 @@ pub fn command(
     which: Which,
     no_print_progress: bool,
 ) -> Result<(), Error> {
-    // Don't exit on ctrl+c as it is used by child erlang shell
+    // Don't exit on ctrl+c as it is used by child Erlang shell
     ctrlc::set_handler(move || {}).expect("Error setting Ctrl-C handler");
     let command = setup(
         paths,
@@ -62,7 +69,7 @@ pub fn setup(
         return Err(Error::InvalidModuleName {
             module: mod_path.to_owned(),
         });
-    };
+    }
 
     let telemetry: &'static dyn Telemetry = if no_print_progress {
         &NullTelemetry
@@ -93,8 +100,8 @@ pub fn setup(
     // Determine which module to run
     let module = module.unwrap_or(match which {
         Which::Src => root_config.name.to_string(),
-        Which::Test => format!("{}_test", &root_config.name),
-        Which::Dev => format!("{}_dev", &root_config.name),
+        Which::Test => format!("{}_test", root_config.name),
+        Which::Dev => format!("{}_dev", root_config.name),
     });
 
     let target = target.unwrap_or(mod_config.target);
@@ -120,6 +127,7 @@ pub fn setup(
             PackageKind::Dependency => TargetSupport::NotEnforced,
         },
         no_print_progress,
+        erlang_output: ErlangOutput::Binary,
     };
 
     let built = crate::build::main(paths, options, manifest)?;
@@ -276,7 +284,7 @@ fn run_javascript_deno_command(
 
     // Enable unstable features and APIs
     if config.javascript.deno.unstable {
-        args.push("--unstable".into())
+        args.push("--unstable".into());
     }
 
     // Enable location API
@@ -287,19 +295,19 @@ fn run_javascript_deno_command(
     // Set deno permissions
     if config.javascript.deno.allow_all {
         // Allow all
-        args.push("--allow-all".into())
+        args.push("--allow-all".into());
     } else {
         // Allow env
         add_deno_flag(&mut args, "--allow-env", &config.javascript.deno.allow_env);
 
         // Allow sys
         if config.javascript.deno.allow_sys {
-            args.push("--allow-sys".into())
+            args.push("--allow-sys".into());
         }
 
         // Allow hrtime
         if config.javascript.deno.allow_hrtime {
-            args.push("--allow-hrtime".into())
+            args.push("--allow-hrtime".into());
         }
 
         // Allow net
@@ -307,7 +315,7 @@ fn run_javascript_deno_command(
 
         // Allow ffi
         if config.javascript.deno.allow_ffi {
-            args.push("--allow-ffi".into())
+            args.push("--allow-ffi".into());
         }
 
         // Allow read
@@ -355,20 +363,20 @@ fn add_deno_flag(args: &mut Vec<String>, flag: &str, flags: &DenoFlag) {
     }
 }
 
+static IS_GLEAM_MODULE_PATTERN: OnceLock<Regex> = OnceLock::new();
+
 /// Check if a module name is a valid gleam module name.
 fn is_gleam_module(module: &str) -> bool {
-    use regex::Regex;
-    static RE: OnceLock<Regex> = OnceLock::new();
-
-    RE.get_or_init(|| {
-        Regex::new(&format!(
-            "^({module}{slash})*{module}$",
-            module = "[a-z][_a-z0-9]*",
-            slash = "/",
-        ))
-        .expect("is_gleam_module() RE regex")
-    })
-    .is_match(module)
+    IS_GLEAM_MODULE_PATTERN
+        .get_or_init(|| {
+            Regex::new(&format!(
+                "^({module}{slash})*{module}$",
+                module = "[a-z][_a-z0-9]*",
+                slash = "/",
+            ))
+            .expect("is_gleam_module() RE regex")
+        })
+        .is_match(module)
 }
 
 /// If provided module is not executable, suggest a possible valid module.

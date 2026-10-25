@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2023 The Gleam contributors
+
 use super::{
     DownloadDependencies, MakeLocker,
     engine::{self, LanguageServerEngine},
@@ -13,15 +16,18 @@ use debug_ignore::DebugIgnore;
 use gleam_core::{
     Result,
     diagnostic::{Diagnostic, ExtraLabel, Level},
-    io::{BeamCompiler, CommandExecutor, FileSystemReader, FileSystemWriter},
-    line_numbers::LineNumbers,
+    io::{BeamCompilerIO, CommandExecutor, FileSystemReader, FileSystemWriter},
 };
+use itertools::Itertools;
 use lsp_server::ResponseError;
 use lsp_types::{
-    self as lsp, InitializeParams, Position, PublishDiagnosticsParams, Range, RenameOptions,
-    TextEdit, Uri as Url,
+    self as lsp, FileOperationFilter, FileOperationOptions, FileOperationPattern,
+    FileOperationPatternKind, FileOperationRegistrationOptions, InitializeParams, Position,
+    PublishDiagnosticsParams, Range, RenameFilesParams, RenameOptions, TextEdit, Uri as Url,
+    WorkspaceOptions,
 };
 use serde_json::Value as Json;
+use src_span::LineNumbers;
 use std::collections::{HashMap, HashSet};
 
 /// This class is responsible for handling the language server protocol and
@@ -48,14 +54,14 @@ impl<'a, IO> LanguageServer<'a, IO>
 where
     IO: FileSystemReader
         + FileSystemWriter
-        + BeamCompiler
+        + BeamCompilerIO
         + CommandExecutor
         + DownloadDependencies
         + MakeLocker
         + Clone,
 {
     pub fn new(connection: &'a lsp_server::Connection, io: IO) -> Result<Self> {
-        let initialise_params = initialisation_handshake(connection);
+        let initialise_params = initialisation_handshake(connection)?;
         let reporter = ConnectionProgressReporter::new(connection, &initialise_params);
         let io = FileSystemProxy::new(io);
         let router = Router::new(reporter, io.clone());
@@ -70,16 +76,16 @@ where
     }
 
     pub fn run(&mut self) -> Result<()> {
-        self.start_watching_gleam_toml();
+        self.start_watching_gleam_toml()?;
         let mut buffer = MessageBuffer::new();
 
         loop {
-            match buffer.receive(*self.connection) {
+            match buffer.receive(*self.connection)? {
                 Next::Stop => break,
                 Next::MorePlease => (),
                 Next::Handle(messages) => {
                     for message in messages {
-                        self.handle_message(message);
+                        self.handle_message(message)?;
                     }
                 }
             }
@@ -88,14 +94,14 @@ where
         Ok(())
     }
 
-    fn handle_message(&mut self, message: Message) {
+    fn handle_message(&mut self, message: Message) -> Result<()> {
         match message {
             Message::Request(id, request) => self.handle_request(id, request),
             Message::Notification(notification) => self.handle_notification(notification),
         }
     }
 
-    fn handle_request(&mut self, id: lsp_server::RequestId, request: Request) {
+    fn handle_request(&mut self, id: lsp_server::RequestId, request: Request) -> Result<()> {
         let (outcome, feedback) = match request {
             Request::Format(param) => self.format(param),
             Request::Hover(param) => self.hover(param),
@@ -110,30 +116,26 @@ where
             Request::GoToTypeDefinition(param) => self.goto_type_definition(param),
             Request::FindReferences(param) => self.find_references(param),
             Request::DocumentHighlight(param) => self.document_highlight(param),
+            Request::RenameFiles(param) => self.rename_files(param),
         };
 
-        self.publish_feedback(feedback);
+        self.publish_feedback(feedback)?;
 
-        let response = match outcome {
-            Ok(payload) => lsp_server::Response {
-                id,
-                error: None,
-                result: Some(payload),
-            },
-            Err(error) => lsp_server::Response {
-                id,
-                error: Some(error),
-                result: None,
-            },
+        let response = lsp_server::Response {
+            id,
+            response_result: outcome,
         };
 
         self.connection
             .sender
             .send(lsp_server::Message::Response(response))
-            .expect("channel send LSP response")
+            .map_err(|error| gleam_core::Error::LspMessageSendFailed {
+                error: error.to_string(),
+            })?;
+        Ok(())
     }
 
-    fn handle_notification(&mut self, notification: Notification) {
+    fn handle_notification(&mut self, notification: Notification) -> Result<()> {
         let feedback = match notification {
             Notification::CompilePlease => self.compile_please(),
             Notification::SourceFileOpened { path, text } => self.source_file_opened(path, text),
@@ -144,15 +146,19 @@ where
             }
             Notification::ConfigFileChanged { path } => self.watched_files_changed(path),
         };
-        self.publish_feedback(feedback);
+        self.publish_feedback(feedback)
     }
 
-    fn publish_feedback(&self, feedback: Feedback) {
-        self.publish_diagnostics(feedback.diagnostics);
-        self.publish_messages(feedback.messages);
+    fn publish_feedback(&self, feedback: Feedback) -> Result<()> {
+        self.publish_diagnostics(feedback.diagnostics)?;
+        self.publish_messages(feedback.messages)?;
+        Ok(())
     }
 
-    fn publish_diagnostics(&self, diagnostics: HashMap<Utf8PathBuf, Vec<Diagnostic>>) {
+    fn publish_diagnostics(
+        &self,
+        diagnostics: HashMap<Utf8PathBuf, Vec<Diagnostic>>,
+    ) -> Result<()> {
         for (path, diagnostics) in diagnostics {
             let diagnostics = diagnostics
                 .into_iter()
@@ -174,11 +180,14 @@ where
             self.connection
                 .sender
                 .send(lsp_server::Message::Notification(notification))
-                .expect("send textDocument/publishDiagnostics");
+                .map_err(|error| gleam_core::Error::LspMessageSendFailed {
+                    error: error.to_string(),
+                })?;
         }
+        Ok(())
     }
 
-    fn start_watching_gleam_toml(&mut self) {
+    fn start_watching_gleam_toml(&mut self) -> Result<()> {
         let supports_watch_files = self
             .initialise_params
             .capabilities
@@ -190,7 +199,7 @@ where
 
         if !supports_watch_files {
             tracing::warn!("lsp_client_cannot_watch_gleam_toml");
-            return;
+            return Ok(());
         }
 
         // Register gleam.toml as a watched file so we get a notification when
@@ -219,10 +228,13 @@ where
         self.connection
             .sender
             .send(lsp_server::Message::Request(request))
-            .expect("send client/registerCapability");
+            .map_err(|error| gleam_core::Error::LspMessageSendFailed {
+                error: error.to_string(),
+            })?;
+        Ok(())
     }
 
-    fn publish_messages(&self, messages: Vec<Diagnostic>) {
+    fn publish_messages(&self, messages: Vec<Diagnostic>) -> Result<()> {
         for message in messages {
             let params = lsp::ShowMessageParams {
                 kind: match message.level {
@@ -238,8 +250,11 @@ where
             self.connection
                 .sender
                 .send(lsp_server::Message::Notification(notification))
-                .expect("send window/showMessage");
+                .map_err(|error| gleam_core::Error::LspMessageSendFailed {
+                    error: error.to_string(),
+                })?;
         }
+        Ok(())
     }
 
     fn respond_with_engine<T, Handler>(
@@ -331,7 +346,7 @@ where
             Err(error) => return self.path_error_response(path, error),
         };
 
-        if let Err(error) = gleam_core::format::pretty(&mut new_text, &src, &path) {
+        if let Err(error) = gleam_format::pretty(&mut new_text, &src, &path) {
             return self.path_error_response(path, error);
         }
 
@@ -432,6 +447,30 @@ where
         )
     }
 
+    fn rename_files(
+        &mut self,
+        params: RenameFilesParams,
+    ) -> (Result<Json, ResponseError>, Feedback) {
+        let renames = params
+            .files
+            .into_iter()
+            .map(|file| {
+                (
+                    Url::parse(&file.old_uri).expect("Uri should be valid"),
+                    Url::parse(&file.new_uri).expect("Uri should be valid"),
+                )
+            })
+            .collect_vec();
+
+        let Some((_, first_renamed_file)) = renames.first() else {
+            return (Ok(serde_json::json!(null)), Feedback::none());
+        };
+
+        self.respond_with_engine(super::path(first_renamed_file), |engine| {
+            engine.rename_files(renames)
+        })
+    }
+
     fn find_references(
         &mut self,
         params: lsp_types::ReferenceParams,
@@ -490,7 +529,7 @@ where
         let mut feedback = self.cache_file_in_memory(path.clone(), text);
         if let Ok(Some(project)) = self.router.project_for_path(path.clone()) {
             feedback.append_feedback(project.feedback.open_file(path));
-        };
+        }
         feedback
     }
 
@@ -498,12 +537,12 @@ where
         let mut feedback = self.discard_in_memory_cache(path.clone());
         if let Ok(Some(project)) = self.router.project_for_path(path.clone()) {
             feedback.append_feedback(project.feedback.close_file(&path));
-        };
+        }
         feedback
     }
 }
 
-fn initialisation_handshake(connection: &lsp_server::Connection) -> InitializeParams {
+fn initialisation_handshake(connection: &lsp_server::Connection) -> Result<InitializeParams> {
     let server_capabilities = lsp::ServerCapabilities {
         text_document_sync: Some(
             lsp::TextDocumentSyncOptions {
@@ -564,7 +603,27 @@ fn initialisation_handshake(connection: &lsp_server::Connection) -> InitializePa
         folding_range_provider: Some(true.into()),
         declaration_provider: None,
         execute_command_provider: None,
-        workspace: None,
+        workspace: Some(WorkspaceOptions {
+            workspace_folders: None,
+            file_operations: Some(FileOperationOptions {
+                did_create: None,
+                will_create: None,
+                will_rename: Some(FileOperationRegistrationOptions {
+                    filters: vec![FileOperationFilter {
+                        scheme: Some("file".into()),
+                        pattern: FileOperationPattern {
+                            glob: "**/*.gleam".into(),
+                            matches: Some(FileOperationPatternKind::File),
+                            options: None,
+                        },
+                    }],
+                }),
+                did_rename: None,
+                did_delete: None,
+                will_delete: None,
+            }),
+            text_document_content: None,
+        }),
         call_hierarchy_provider: None,
         semantic_tokens_provider: None,
         moniker_provider: None,
@@ -580,12 +639,15 @@ fn initialisation_handshake(connection: &lsp_server::Connection) -> InitializePa
     };
     let server_capabilities_json =
         serde_json::to_value(server_capabilities).expect("server_capabilities_serde");
-    let initialise_params_json = connection
-        .initialize(server_capabilities_json)
-        .expect("LSP initialize");
+    let initialise_params_json =
+        connection
+            .initialize(server_capabilities_json)
+            .map_err(|error| gleam_core::Error::LspMessageReceiveFailed {
+                error: error.to_string(),
+            })?;
     let initialise_params: InitializeParams =
         serde_json::from_value(initialise_params_json).expect("LSP InitializeParams from json");
-    initialise_params
+    Ok(initialise_params)
 }
 
 fn diagnostic_to_lsp(diagnostic: Diagnostic) -> Vec<lsp::Diagnostic> {

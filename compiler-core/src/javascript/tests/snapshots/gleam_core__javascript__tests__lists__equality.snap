@@ -11,9 +11,13 @@ pub fn go() {
 
 
 ----- COMPILED JAVASCRIPT
-import { toList, isEqual } from "../gleam.mjs";
+import {
+  Empty as $Empty,
+  List$Empty$const as $List$Empty$const,
+  prepend as listPrepend,
+} from "../gleam.mjs";
 
 export function go() {
-  isEqual(toList([]), toList([1]));
-  return !isEqual(toList([]), toList([1]));
+  listPrepend(1, $List$Empty$const) instanceof $Empty;
+  return !(listPrepend(1, $List$Empty$const) instanceof $Empty);
 }

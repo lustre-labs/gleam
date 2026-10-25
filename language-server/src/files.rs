@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2023 The Gleam contributors
+
 use std::collections::HashSet;
 use std::time::SystemTime;
 
@@ -7,8 +10,8 @@ use gleam_core::{
     Result,
     error::Error,
     io::{
-        BeamCompiler, Command, CommandExecutor, FileSystemReader, FileSystemWriter, ReadDir, Stdio,
-        WrappedReader, memory::InMemoryFileSystem,
+        BeamCompilerIO, Command, CommandExecutor, FileSystemReader, FileSystemWriter, ReadDir,
+        Stdio, WrappedReader, memory::InMemoryFileSystem,
     },
 };
 
@@ -166,9 +169,9 @@ where
     }
 }
 
-impl<IO> BeamCompiler for FileSystemProxy<IO>
+impl<IO> BeamCompilerIO for FileSystemProxy<IO>
 where
-    IO: BeamCompiler,
+    IO: BeamCompilerIO,
 {
     fn compile_beam(
         &self,
@@ -176,7 +179,7 @@ where
         _lib: &Utf8Path,
         _modules: &HashSet<Utf8PathBuf>,
         _stdio: Stdio,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<(), Error> {
         panic!("The language server is not permitted to create subprocesses")
     }
 }

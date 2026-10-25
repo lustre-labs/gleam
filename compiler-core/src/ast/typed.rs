@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 use type_::{FieldMap, TypedCallArg};
 
 use super::*;
@@ -427,9 +430,34 @@ impl TypedExpr {
                 .or_else(|| self.self_if_contains_location(byte_index)),
 
             Self::RecordAccess {
-                record: expression, ..
-            }
-            | Self::TupleIndex {
+                record,
+                label,
+                location,
+                type_,
+                documentation,
+                ..
+            } => record
+                .find_node(byte_index)
+                .or_else(|| {
+                    // The label is the final part of the access, so its span
+                    // ends where the whole `record.label` expression does.
+                    let label_location =
+                        SrcSpan::new(location.end - label.len() as u32, location.end);
+                    if label_location.contains(byte_index) {
+                        Some(Located::RecordAccessLabel {
+                            location: label_location,
+                            field_type: type_.clone(),
+                            label: label.clone(),
+                            record_type: record.type_(),
+                            documentation: documentation.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| self.self_if_contains_location(byte_index)),
+
+            Self::TupleIndex {
                 tuple: expression, ..
             } => expression
                 .find_node(byte_index)
@@ -993,6 +1021,8 @@ impl TypedExpr {
         matches!(self, Self::Pipeline { .. })
     }
 
+    /// Returns true if this function is guaranteed to not have any side
+    /// effects.
     pub fn is_pure_value_constructor(&self) -> bool {
         match self {
             TypedExpr::Int { .. }
@@ -1018,10 +1048,8 @@ impl TypedExpr {
             // long as it's not called!
             TypedExpr::ModuleSelect { .. } => true,
 
-            // A pipeline is a pure value constructor if its last step is a record builder,
-            // or a call to a pure function. For example:
-            //  - `wibble() |> wobble() |> Ok`
-            //  - `"hello" |> fn(s) { s <> " world!" }`
+            // A pipeline is a pure value constructor if all of its steps are
+            // pure.
             TypedExpr::Pipeline {
                 first_value,
                 assignments,
@@ -1035,6 +1063,9 @@ impl TypedExpr {
                     && finally.is_pure_value_constructor()
             }
 
+            // A function is a pure value constructor if it is a record builder,
+            // or the called function is understood to be pure. Also all of its
+            // arguments must be pure value constructors!
             TypedExpr::Call { fun, arguments, .. } => {
                 (fun.is_record_literal() || fun.called_function_purity().is_pure())
                     && arguments
@@ -1063,9 +1094,9 @@ impl TypedExpr {
                     && clauses.iter().all(|c| c.then.is_pure_value_constructor())
             }
 
-            // `panic`, `todo`, and placeholders are never considered pure value constructors,
-            // we don't want to raise a warning for an unused value if it's one
-            // of those.
+            // `panic`, `todo`, and placeholders are never considered pure value
+            // constructors, we don't want to raise a warning for an unused
+            // value if it's one of those.
             TypedExpr::Todo { .. }
             | TypedExpr::Panic { .. }
             | TypedExpr::Echo { .. }
@@ -1183,9 +1214,8 @@ impl TypedExpr {
                         ..
                     },
                 ..
-            } => *arity > 0,
-
-            TypedExpr::ModuleSelect {
+            }
+            | TypedExpr::ModuleSelect {
                 constructor: ModuleValueConstructor::Record { arity, .. },
                 ..
             } => *arity > 0,
@@ -1214,6 +1244,96 @@ impl TypedExpr {
             | TypedExpr::NegateBool { .. }
             | TypedExpr::NegateInt { .. }
             | TypedExpr::Invalid { .. } => false,
+        }
+    }
+
+    /// Returns the name of the module and the function, if this is a well-defined (named)
+    /// function.
+    ///
+    pub fn module_function_name(&self) -> Option<(&EcoString, &EcoString)> {
+        match self {
+            TypedExpr::Var {
+                constructor:
+                    ValueConstructor {
+                        variant: ValueConstructorVariant::ModuleFn { module, name, .. },
+                        ..
+                    },
+                ..
+            }
+            | TypedExpr::ModuleSelect {
+                constructor: ModuleValueConstructor::Fn { module, name, .. },
+                ..
+            } => Some((module, name)),
+
+            TypedExpr::Int { .. }
+            | TypedExpr::Float { .. }
+            | TypedExpr::String { .. }
+            | TypedExpr::Block { .. }
+            | TypedExpr::Pipeline { .. }
+            | TypedExpr::Var { .. }
+            | TypedExpr::Fn { .. }
+            | TypedExpr::List { .. }
+            | TypedExpr::Call { .. }
+            | TypedExpr::BinOp { .. }
+            | TypedExpr::Case { .. }
+            | TypedExpr::RecordAccess { .. }
+            | TypedExpr::PositionalAccess { .. }
+            | TypedExpr::ModuleSelect { .. }
+            | TypedExpr::Tuple { .. }
+            | TypedExpr::TupleIndex { .. }
+            | TypedExpr::Todo { .. }
+            | TypedExpr::Panic { .. }
+            | TypedExpr::Echo { .. }
+            | TypedExpr::BitArray { .. }
+            | TypedExpr::RecordUpdate { .. }
+            | TypedExpr::NegateBool { .. }
+            | TypedExpr::NegateInt { .. }
+            | TypedExpr::Invalid { .. } => None,
+        }
+    }
+
+    /// If this expression is a record constructor function with non-zero
+    /// arity, returns the name of the variant it constructs.
+    ///
+    pub fn record_constructor_variant_name(&self) -> Option<&EcoString> {
+        match self {
+            TypedExpr::Var {
+                constructor:
+                    ValueConstructor {
+                        variant: ValueConstructorVariant::Record { name, arity, .. },
+                        ..
+                    },
+                ..
+            }
+            | TypedExpr::ModuleSelect {
+                constructor: ModuleValueConstructor::Record { name, arity, .. },
+                ..
+            } if *arity > 0 => Some(name),
+
+            TypedExpr::Int { .. }
+            | TypedExpr::Float { .. }
+            | TypedExpr::String { .. }
+            | TypedExpr::Block { .. }
+            | TypedExpr::Pipeline { .. }
+            | TypedExpr::Var { .. }
+            | TypedExpr::Fn { .. }
+            | TypedExpr::List { .. }
+            | TypedExpr::Call { .. }
+            | TypedExpr::BinOp { .. }
+            | TypedExpr::Case { .. }
+            | TypedExpr::RecordAccess { .. }
+            | TypedExpr::PositionalAccess { .. }
+            | TypedExpr::ModuleSelect { .. }
+            | TypedExpr::Tuple { .. }
+            | TypedExpr::TupleIndex { .. }
+            | TypedExpr::Todo { .. }
+            | TypedExpr::Panic { .. }
+            | TypedExpr::Echo { .. }
+            | TypedExpr::BitArray { .. }
+            | TypedExpr::RecordUpdate { .. }
+            | TypedExpr::NegateBool { .. }
+            | TypedExpr::NegateInt { .. }
+            | TypedExpr::Invalid { .. } => None,
         }
     }
 
@@ -1734,7 +1854,7 @@ impl TypedExpr {
             let Some(label) = argument.label.as_ref() else {
                 continue;
             };
-            unchanged_arguments.push((label.clone(), argument.value.type_()))
+            unchanged_arguments.push((label.clone(), argument.value.type_()));
         }
         Some(unchanged_arguments)
     }

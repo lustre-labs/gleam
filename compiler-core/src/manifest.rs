@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2021 The Gleam contributors
+
 use std::collections::HashMap;
 use std::fmt;
 
@@ -90,22 +93,27 @@ impl Manifest {
             match source {
                 ManifestPackageSource::Hex { outer_checksum } => {
                     buffer.push_str(r#", source = "hex", outer_checksum = ""#);
-                    buffer.push_str(&outer_checksum.to_string());
+                    buffer.push_str(&outer_checksum.base_16_encoded_string());
                     buffer.push('"');
                 }
-                ManifestPackageSource::Git { repo, commit } => {
+                ManifestPackageSource::Git { repo, commit, path } => {
                     buffer.push_str(r#", source = "git", repo = ""#);
                     buffer.push_str(repo);
                     buffer.push_str(r#"", commit = ""#);
                     buffer.push_str(commit);
                     buffer.push('"');
+                    if let Some(path) = path {
+                        buffer.push_str(r#", path = ""#);
+                        buffer.push_str(&path.as_str().replace('\\', "/"));
+                        buffer.push('"');
+                    }
                 }
                 ManifestPackageSource::Local { path } => {
                     buffer.push_str(r#", source = "local", path = ""#);
                     buffer.push_str(&make_relative(root_path, path).as_str().replace('\\', "/"));
                     buffer.push('"');
                 }
-            };
+            }
 
             buffer.push_str(" },\n");
         }
@@ -127,8 +135,8 @@ impl Manifest {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Base16Checksum(pub Vec<u8>);
 
-impl ToString for Base16Checksum {
-    fn to_string(&self) -> String {
+impl Base16Checksum {
+    pub fn base_16_encoded_string(&self) -> String {
         base16::encode_upper(&self.0)
     }
 }
@@ -220,10 +228,10 @@ impl ManifestPackage {
 impl Default for ManifestPackage {
     fn default() -> Self {
         Self {
-            name: Default::default(),
-            build_tools: Default::default(),
-            otp_app: Default::default(),
-            requirements: Default::default(),
+            name: EcoString::new(),
+            build_tools: vec![],
+            otp_app: None,
+            requirements: vec![],
             version: Version::new(1, 0, 0),
             source: ManifestPackageSource::Hex {
                 outer_checksum: Base16Checksum(vec![]),
@@ -238,7 +246,16 @@ pub enum ManifestPackageSource {
     #[serde(rename = "hex")]
     Hex { outer_checksum: Base16Checksum },
     #[serde(rename = "git")]
-    Git { repo: EcoString, commit: EcoString },
+    Git {
+        repo: EcoString,
+        commit: EcoString,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "super::config::package_scoped_path::optional_deserialize"
+        )]
+        path: Option<Utf8PathBuf>,
+    },
     #[serde(rename = "local")]
     Local { path: Utf8PathBuf }, // should be the canonical path
 }
@@ -278,17 +295,17 @@ mod tests {
     #[cfg(windows)]
     const HOME: &'static str = "C:\\home\\louis\\packages\\some_folder";
 
-    #[cfg(windows)]
-    const PACKAGE: &'static str = "C:\\home\\louis\\packages\\path\\to\\package";
-
-    #[cfg(windows)]
-    const PACKAGE_WITH_UNC: &'static str = "\\\\?\\C:\\home\\louis\\packages\\path\\to\\package";
-
     #[cfg(not(windows))]
     const HOME: &str = "/home/louis/packages/some_folder";
 
+    #[cfg(windows)]
+    const PACKAGE: &'static str = "C:\\home\\louis\\packages\\path\\to\\package";
+
     #[cfg(not(windows))]
     const PACKAGE: &str = "/home/louis/packages/path/to/package";
+
+    #[cfg(windows)]
+    const PACKAGE_WITH_UNC: &'static str = "\\\\?\\C:\\home\\louis\\packages\\path\\to\\package";
 
     #[test]
     fn manifest_toml_format() {
@@ -299,6 +316,14 @@ mod tests {
                 (
                     "awsome_local2".into(),
                     Requirement::git("https://github.com/gleam-lang/gleam.git", "bd9fe02f"),
+                ),
+                (
+                    "awsome_local3".into(),
+                    Requirement::git_with_path(
+                        "https://github.com/gleam-lang/gleam.git",
+                        "bd9fe02f",
+                        "packages/sub",
+                    ),
                 ),
                 (
                     "awsome_local1".into(),
@@ -348,6 +373,19 @@ mod tests {
                     source: ManifestPackageSource::Git {
                         repo: "https://github.com/gleam-lang/gleam.git".into(),
                         commit: "bd9fe02f72250e6a136967917bcb1bdccaffa3c8".into(),
+                        path: None,
+                    },
+                },
+                ManifestPackage {
+                    name: "awsome_local3".into(),
+                    version: Version::new(1, 2, 3),
+                    build_tools: ["gleam".into()].into(),
+                    otp_app: None,
+                    requirements: vec![],
+                    source: ManifestPackageSource::Git {
+                        repo: "https://github.com/gleam-lang/gleam.git".into(),
+                        commit: "bd9fe02f72250e6a136967917bcb1bdccaffa3c8".into(),
+                        path: Some("packages/sub".into()),
                     },
                 },
                 ManifestPackage {
@@ -388,6 +426,7 @@ packages = [
   { name = "aaa", version = "0.4.0", build_tools = ["rebar3", "make"], requirements = ["gleam_stdlib", "zzz"], otp_app = "aaa_app", source = "hex", outer_checksum = "0316" },
   { name = "awsome_local1", version = "1.2.3", build_tools = ["gleam"], requirements = [], source = "local", path = "../path/to/package" },
   { name = "awsome_local2", version = "1.2.3", build_tools = ["gleam"], requirements = [], source = "git", repo = "https://github.com/gleam-lang/gleam.git", commit = "bd9fe02f72250e6a136967917bcb1bdccaffa3c8" },
+  { name = "awsome_local3", version = "1.2.3", build_tools = ["gleam"], requirements = [], source = "git", repo = "https://github.com/gleam-lang/gleam.git", commit = "bd9fe02f72250e6a136967917bcb1bdccaffa3c8", path = "packages/sub" },
   { name = "gleam_stdlib", version = "0.17.1", build_tools = ["gleam"], requirements = [], source = "hex", outer_checksum = "0116" },
   { name = "gleeunit", version = "0.4.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], source = "hex", outer_checksum = "032E" },
   { name = "zzz", version = "0.4.0", build_tools = ["mix"], requirements = [], source = "hex", outer_checksum = "0316" },
@@ -397,9 +436,48 @@ packages = [
 aaa = { version = "> 0.0.0" }
 awsome_local1 = { path = "../path/to/package" }
 awsome_local2 = { git = "https://github.com/gleam-lang/gleam.git", ref = "bd9fe02f" }
+awsome_local3 = { git = "https://github.com/gleam-lang/gleam.git", ref = "bd9fe02f", path = "packages/sub" }
 gleam_stdlib = { version = "~> 0.17" }
 gleeunit = { version = "~> 0.1" }
 zzz = { version = "> 0.0.0" }
+"#
+        );
+    }
+
+    #[test]
+    fn git_package_path_with_backslashes_is_normalised() {
+        let manifest = Manifest {
+            requirements: HashMap::new(),
+            packages: vec![ManifestPackage {
+                name: "wibble".into(),
+                version: Version::new(1, 0, 0),
+                build_tools: ["gleam".into()].into(),
+                otp_app: None,
+                requirements: vec![],
+                source: ManifestPackageSource::Git {
+                    repo: "https://github.com/gleam-lang/gleam.git".into(),
+                    commit: "bd9fe02f72250e6a136967917bcb1bdccaffa3c8".into(),
+                    path: Some("packages\\wibble".into()),
+                },
+            }],
+        };
+
+        let buffer = manifest.to_toml(HOME.into());
+        assert_eq!(
+            buffer,
+            r#"# Do not manually edit this file, it is managed by Gleam.
+#
+# This file locks the dependency versions used, to make your build
+# deterministic and to prevent unexpected versions from being included
+# in your application.
+#
+# You should check this file into your source control repository.
+
+packages = [
+  { name = "wibble", version = "1.0.0", build_tools = ["gleam"], requirements = [], source = "git", repo = "https://github.com/gleam-lang/gleam.git", commit = "bd9fe02f72250e6a136967917bcb1bdccaffa3c8", path = "packages/wibble" },
+]
+
+[requirements]
 "#
         );
     }
@@ -463,6 +541,7 @@ zzz = { version = "> 0.0.0" }
                     source: ManifestPackageSource::Git {
                         repo: "https://github.com/gleam-lang/gleam.git".into(),
                         commit: "bd9fe02f72250e6a136967917bcb1bdccaffa3c8".into(),
+                        path: None,
                     },
                 },
                 ManifestPackage {
@@ -620,16 +699,22 @@ impl PackageChanges {
                 Some(old) if old.version == new.version => match (&old.source, &new.source) {
                     (
                         ManifestPackageSource::Git {
-                            commit: old_hash, ..
+                            commit: old_hash,
+                            path: old_path,
+                            ..
                         },
                         ManifestPackageSource::Git {
-                            commit: new_hash, ..
+                            commit: new_hash,
+                            path: new_path,
+                            ..
                         },
-                    ) if old_hash != new_hash => changed_git.push(ChangedGit {
-                        name: new.name.clone(),
-                        old_hash: old_hash.clone(),
-                        new_hash: new_hash.clone(),
-                    }),
+                    ) if old_hash != new_hash || old_path != new_path => {
+                        changed_git.push(ChangedGit {
+                            name: new.name.clone(),
+                            old_hash: old_hash.clone(),
+                            new_hash: new_hash.clone(),
+                        });
+                    }
                     (
                         ManifestPackageSource::Hex { .. }
                         | ManifestPackageSource::Local { .. }
@@ -668,8 +753,10 @@ mod manifest_update_tests {
     use ecow::EcoString;
     use hexpm::version::Version;
 
-    use crate::manifest::{Base16Checksum, ManifestPackage, ManifestPackageSource, PackageChanges};
-    use crate::manifest::{Changed, Manifest};
+    use crate::manifest::{
+        Base16Checksum, Changed, ChangedGit, Manifest, ManifestPackage, ManifestPackageSource,
+        PackageChanges,
+    };
 
     #[test]
     fn resolved_with_updated() {
@@ -775,6 +862,46 @@ mod manifest_update_tests {
         assert_eq!(changes.removed, vec![name.clone()]);
         assert_eq!(changes.added, vec![(name.clone(), version.clone())]);
     }
+
+    #[test]
+    fn resolved_with_git_path_change_same_commit() {
+        let name = EcoString::from("wibble");
+        let commit = EcoString::from("bd9fe02f72250e6a136967917bcb1bdccaffa3c8");
+        let package = |path: &str| ManifestPackage {
+            name: name.clone(),
+            version: Version::new(1, 0, 0),
+            build_tools: vec![],
+            otp_app: None,
+            requirements: vec![],
+            source: ManifestPackageSource::Git {
+                repo: "https://github.com/gleam-lang/gleam.git".into(),
+                commit: commit.clone(),
+                path: Some(path.into()),
+            },
+        };
+
+        let old = Manifest {
+            requirements: HashMap::new(),
+            packages: vec![package("packages/a")],
+        };
+        let new = Manifest {
+            requirements: HashMap::new(),
+            packages: vec![package("packages/b")],
+        };
+
+        let changes = PackageChanges::between_manifests(&old, &new);
+        assert_eq!(
+            changes.changed_git,
+            vec![ChangedGit {
+                name: name.clone(),
+                old_hash: commit.clone(),
+                new_hash: commit.clone(),
+            }]
+        );
+        assert!(changes.added.is_empty());
+        assert!(changes.changed.is_empty());
+        assert!(changes.removed.is_empty());
+    }
 }
 
 #[test]
@@ -831,6 +958,25 @@ gleam_stdlib = { version = ">= 0.58.0 and < 2.0.0" }
 
     let manifest: Result<Manifest, _> = toml::from_str(toml);
     let error = manifest.expect_err("should fail to deserialise because invalid name");
+    insta::assert_snapshot!(insta::internals::AutoName, error.to_string());
+}
+
+#[test]
+fn git_package_with_escaping_path() {
+    let toml = r#"# This file was generated by Gleam
+# You typically do not need to edit this file
+
+packages = [
+  { name = "wibble", version = "0.1.0", build_tools = ["gleam"], requirements = [], source = "git", repo = "https://github.com/gleam-lang/gleam.git", commit = "bd9fe02f72250e6a136967917bcb1bdccaffa3c8", path = "../escape" },
+]
+
+[requirements]
+wibble = { git = "https://github.com/gleam-lang/gleam.git", ref = "main", path = "wibble" }
+"#;
+
+    let manifest: Result<Manifest, _> = toml::from_str(toml);
+    let error =
+        manifest.expect_err("should fail to deserialise because path escapes the repository");
     insta::assert_snapshot!(insta::internals::AutoName, error.to_string());
 }
 

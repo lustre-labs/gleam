@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 use crate::{
-    ast::{BitArraySegmentTruncation, SrcSpan, TodoKind},
+    ast::{BitArraySegmentTruncation, TodoKind},
     build::Target,
     diagnostic::{self, Diagnostic, ExtraLabel, Location},
     error::wrap,
@@ -18,6 +21,7 @@ use camino::Utf8PathBuf;
 use debug_ignore::DebugIgnore;
 use ecow::EcoString;
 use itertools::Itertools;
+use src_span::SrcSpan;
 use std::{
     io::Write,
     sync::{Arc, atomic::Ordering},
@@ -184,7 +188,7 @@ pub enum Warning {
     },
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Copy)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DeprecatedSyntaxWarning {
     /// If someone uses the deprecated syntax to append to a list:
     /// `["a"..rest]`, notice how there's no comma!
@@ -217,6 +221,21 @@ pub enum DeprecatedSyntaxWarning {
     ///
     DeprecatedListCatchAllPattern {
         location: SrcSpan,
+    },
+
+    /// If someone uses the deprecated syntax to bind an entire list to a
+    /// variable with a spread, instead of using the variable directly:
+    /// ```gleam
+    /// case list {
+    ///   [..x] -> todo
+    /// //^^^^^ this matches the whole list so `x` should be used instead!
+    ///   _ ->
+    /// }
+    /// ```
+    ///
+    DeprecatedListSpreadAsVariablePattern {
+        location: SrcSpan,
+        name: EcoString,
     },
 
     /// If a record pattern has a spread that is not preceded by a comma:
@@ -347,7 +366,32 @@ To match on all possible lists, use the `_` catch-all pattern instead.",
                 level: diagnostic::Level::Warning,
                 location: Some(Location {
                     label: diagnostic::Label {
-                        text: Some("This can be replaced with `_`".into()),
+                        text: Some("Replace this with `_`".into()),
+                        span: *location,
+                    },
+                    path: path.clone(),
+                    src: src.clone(),
+                    extra_labels: vec![],
+                }),
+            },
+
+            Warning::DeprecatedSyntax {
+                path,
+                src,
+                warning:
+                    DeprecatedSyntaxWarning::DeprecatedListSpreadAsVariablePattern { location, name },
+            } => Diagnostic {
+                title: "Deprecated list pattern matching syntax".into(),
+                text: wrap_format!(
+                    "This syntax for pattern matching on lists is deprecated.
+This spread matches the entire list, so the variable {name} can be used as \
+the pattern directly instead.",
+                ),
+                hint: None,
+                level: diagnostic::Level::Warning,
+                location: Some(Location {
+                    label: diagnostic::Label {
+                        text: Some(format!("Replace this with `{name}`")),
                         span: *location,
                     },
                     path: path.clone(),
@@ -437,31 +481,43 @@ comment so it is not attached to any definition.",
                     type_,
                     names,
                 } => {
-                    let mut text = String::new();
-                    text.push_str(
-                        "\
+                    let (title, text) = match kind {
+                        TodoKind::Keyword => {
+                            let text = "\
 This code will crash if it is run. Be sure to finish it before
-running your program.",
-                    );
-                    let title = match kind {
-                        TodoKind::Keyword => "Todo found",
+running your program.";
+
+                            ("Todo found", text)
+                        }
+
                         TodoKind::EmptyBlock => {
-                            text.push_str(
-                                "
-A block must always contain at least one expression.",
-                            );
-                            "Incomplete block"
+                            let text = "\
+A block must always contain at least one expression.
+
+A todo expression has been used in place of the missing code,
+so this code will crash if it is run. Be sure to finish it before
+running your program.";
+                            ("Incomplete block", text)
                         }
-                        TodoKind::EmptyFunction { .. } => "Unimplemented function",
+                        TodoKind::EmptyFunction { .. } => {
+                            let text = "\
+A function must always have an implementation.
+
+A todo expression has been used in place of the missing body,
+so this code will crash if it is run. Be sure to finish it before
+running your program.";
+                            ("Unimplemented function", text)
+                        }
                         TodoKind::IncompleteUse => {
-                            text.push_str(
-                                "
-A use expression must always be followed by at least one expression.",
-                            );
-                            "Incomplete use expression"
+                            let text = "\
+A use expression must always be followed by at least one expression.
+
+A todo expression has been used in place of the missing code, so
+this code will crash if it is run. Be sure to finish it before
+running your program.";
+                            ("Incomplete use expression", text)
                         }
-                    }
-                    .into();
+                    };
 
                     let hint = if !type_.is_variable() {
                         Some(format!(
@@ -473,8 +529,8 @@ A use expression must always be followed by at least one expression.",
                     };
 
                     Diagnostic {
-                        title,
-                        text,
+                        title: title.into(),
+                        text: text.into(),
                         level: diagnostic::Level::Warning,
                         location: Some(Location {
                             path: path.to_path_buf(),
@@ -1097,16 +1153,20 @@ Either change the pattern or use `panic` to unconditionally fail.",
                     };
                     let mut text = format!("`{name}` is not a function");
                     match arguments {
-                        0 => text.push_str(&format!(
-                            ", you can just write `{name}` instead of `{name}()`."
-                        )),
+                        0 => {
+                            text.push_str(", you can just write `");
+                            text.push_str(name);
+                            text.push_str("` instead of `");
+                            text.push_str(name);
+                            text.push_str("()`.");
+                        }
                         1 => text.push_str(
                             " and will crash before it can do anything with this argument.",
                         ),
                         _ => text.push_str(
                             " and will crash before it can do anything with these arguments.",
                         ),
-                    };
+                    }
 
                     let hint = match arguments {
                         0 => None,
@@ -1480,6 +1540,49 @@ The imported value could not be used in this module anyway."
                                     ComparisonOutcome::AlwaysFails => "False",
                                 }
                             )),
+                            span: *location,
+                        },
+                        path: path.clone(),
+                        src: src.clone(),
+                        extra_labels: vec![],
+                    }),
+                },
+
+                type_::Warning::PipeIntoCallWhichReturnsFunction { location } => Diagnostic {
+                    title: "Deprecated pipe use".into(),
+                    text: wrap(
+                        "This use of pipelines is deprecated, as it creates \
+ambiguity in pipe syntax. Currently `a |> b(c)` can desugar to either `b(a, c)` or \
+`b(a)(c)` depending on the type of `b`. The latter syntax is deprecated, and should \
+not be used.",
+                    ),
+                    hint: Some(
+                        "Add an extra set of parentheses after the call, like `a |> b(c)()`".into(),
+                    ),
+                    level: diagnostic::Level::Warning,
+                    location: Some(Location {
+                        label: diagnostic::Label {
+                            text: Some("This should have an extra set of parentheses".into()),
+                            span: *location,
+                        },
+                        path: path.clone(),
+                        src: src.clone(),
+                        extra_labels: vec![],
+                    }),
+                },
+
+                type_::Warning::EmptyStringBitArraySegment { location } => Diagnostic {
+                    title: "Empty string segment".into(),
+                    text: wrap(
+                        "This empty string segment is ignored in the pattern, \
+so it can be safely removed. Empty string segments are deprecated and will become \
+an error in a future version.",
+                    ),
+                    hint: None,
+                    level: diagnostic::Level::Warning,
+                    location: Some(Location {
+                        label: diagnostic::Label {
+                            text: Some("Remove this empty string".into()),
                             span: *location,
                         },
                         path: path.clone(),

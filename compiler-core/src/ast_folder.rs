@@ -1,27 +1,31 @@
-use ecow::EcoString;
-use itertools::Itertools;
-use num_bigint::BigInt;
-use vec1::Vec1;
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2023 The Gleam contributors
 
 use crate::{
     analyse::Inferred,
     ast::{
         Assert, AssignName, Assignment, BinOp, BitArraySize, CallArg, Constant, Definition,
         FunctionLiteralKind, InvalidExpression, Pattern, RecordBeingUpdated, RecordUpdateArg,
-        SrcSpan, Statement, TailPattern, TargetedDefinition, TodoKind, TypeAst, TypeAstConstructor,
-        TypeAstFn, TypeAstHole, TypeAstTuple, TypeAstVar, UntypedArg, UntypedAssert,
-        UntypedAssignment, UntypedClause, UntypedConstant, UntypedConstantBitArraySegment,
-        UntypedCustomType, UntypedDefinition, UntypedExpr, UntypedExprBitArraySegment,
-        UntypedFunction, UntypedImport, UntypedModule, UntypedModuleConstant, UntypedPattern,
-        UntypedPatternBitArraySegment, UntypedRecordUpdateArg, UntypedStatement,
-        UntypedTailPattern, UntypedTypeAlias, UntypedUse, UntypedUseAssignment, Use, UseAssignment,
+        Statement, StringPrefixLeftSideAssignment, TailPattern, TargetedDefinition, TodoKind,
+        TypeAst, TypeAstConstructor, TypeAstFn, TypeAstHole, TypeAstTuple, TypeAstVar, UntypedArg,
+        UntypedAssert, UntypedAssignment, UntypedClause, UntypedConstant,
+        UntypedConstantBitArraySegment, UntypedCustomType, UntypedDefinition, UntypedExpr,
+        UntypedExprBitArraySegment, UntypedFunction, UntypedImport, UntypedModule,
+        UntypedModuleConstant, UntypedPattern, UntypedPatternBitArraySegment,
+        UntypedRecordUpdateArg, UntypedStatement, UntypedTailPattern, UntypedTypeAlias, UntypedUse,
+        UntypedUseAssignment, Use, UseAssignment,
     },
     build::Target,
     parse::LiteralFloatValue,
     type_::error::VariableOrigin,
 };
+use ecow::EcoString;
+use itertools::Itertools;
+use num_bigint::BigInt;
+use src_span::SrcSpan;
+use vec1::Vec1;
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub trait UntypedModuleFolder: TypeAstFolder + UntypedExprFolder {
     /// You probably don't want to override this method.
     fn fold_module(&mut self, mut module: UntypedModule) -> UntypedModule {
@@ -163,7 +167,7 @@ pub trait UntypedModuleFolder: TypeAstFolder + UntypedExprFolder {
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub trait TypeAstFolder {
     /// Visit a node and potentially replace it with another node using the
     /// `fold_*` methods. Afterwards, the `walk` method is called on the new
@@ -238,7 +242,7 @@ pub trait TypeAstFolder {
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub trait UntypedExprFolder: TypeAstFolder + UntypedConstantFolder + PatternFolder {
     /// Visit a node and potentially replace it with another node using the
     /// `fold_*` methods. Afterwards, the `walk` method is called on the new
@@ -308,7 +312,7 @@ pub trait UntypedExprFolder: TypeAstFolder + UntypedConstantFolder + PatternFold
                 right,
             } => self.fold_bin_op(location, operator, operator_start, left, right),
 
-            UntypedExpr::PipeLine { expressions } => self.fold_pipe_line(expressions),
+            UntypedExpr::Pipeline { expressions } => self.fold_pipe_line(expressions),
 
             UntypedExpr::Case {
                 location,
@@ -440,7 +444,7 @@ pub trait UntypedExprFolder: TypeAstFolder + UntypedConstantFolder + PatternFold
                     .into_iter()
                     .map(|element| self.fold_expr(element))
                     .collect();
-                let tail = tail.map(|e| Box::new(self.fold_expr(*e)));
+                let tail = tail.map(|tail| Box::new(self.fold_expr(*tail)));
                 UntypedExpr::List {
                     location,
                     elements,
@@ -488,9 +492,9 @@ pub trait UntypedExprFolder: TypeAstFolder + UntypedConstantFolder + PatternFold
                 }
             }
 
-            UntypedExpr::PipeLine { expressions } => {
-                let expressions = expressions.mapped(|e| self.fold_expr(e));
-                UntypedExpr::PipeLine { expressions }
+            UntypedExpr::Pipeline { expressions } => {
+                let expressions = expressions.mapped(|expression| self.fold_expr(expression));
+                UntypedExpr::Pipeline { expressions }
             }
 
             UntypedExpr::Case {
@@ -498,7 +502,10 @@ pub trait UntypedExprFolder: TypeAstFolder + UntypedConstantFolder + PatternFold
                 subjects,
                 clauses,
             } => {
-                let subjects = subjects.into_iter().map(|e| self.fold_expr(e)).collect();
+                let subjects = subjects
+                    .into_iter()
+                    .map(|subject| self.fold_expr(subject))
+                    .collect();
                 let clauses = clauses.map(|clauses| {
                     clauses
                         .into_iter()
@@ -818,7 +825,7 @@ pub trait UntypedExprFolder: TypeAstFolder + UntypedConstantFolder + PatternFold
     }
 
     fn fold_pipe_line(&mut self, expressions: Vec1<UntypedExpr>) -> UntypedExpr {
-        UntypedExpr::PipeLine { expressions }
+        UntypedExpr::Pipeline { expressions }
     }
 
     fn fold_case(
@@ -944,7 +951,7 @@ pub trait UntypedExprFolder: TypeAstFolder + UntypedConstantFolder + PatternFold
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub trait UntypedConstantFolder {
     /// You probably don't want to override this method.
     fn fold_constant(&mut self, constant: UntypedConstant) -> UntypedConstant {
@@ -990,13 +997,20 @@ pub trait UntypedConstantFolder {
 
             Constant::Record {
                 location,
+                arguments_start_position,
                 module,
                 name,
                 arguments,
                 type_: (),
                 field_map: _,
                 record_constructor: _,
-            } => self.fold_constant_record(location, module, name, arguments),
+            } => self.fold_constant_record(
+                location,
+                arguments_start_position,
+                module,
+                name,
+                arguments,
+            ),
 
             Constant::RecordUpdate {
                 location,
@@ -1028,11 +1042,16 @@ pub trait UntypedConstantFolder {
                 type_: (),
             } => self.fold_constant_var(location, module, name),
 
-            Constant::StringConcatenation {
+            Constant::BinaryOperator {
                 location,
+                operator_start,
                 left,
                 right,
-            } => self.fold_constant_string_concatenation(location, left, right),
+                operator,
+                type_: (),
+            } => {
+                self.fold_constant_binary_operator(location, operator_start, operator, left, right)
+            }
 
             Constant::Invalid {
                 location,
@@ -1113,12 +1132,14 @@ pub trait UntypedConstantFolder {
     fn fold_constant_record(
         &mut self,
         location: SrcSpan,
+        arguments_start_position: u32,
         module: Option<(EcoString, SrcSpan)>,
         name: EcoString,
         arguments: Option<Vec<CallArg<UntypedConstant>>>,
     ) -> UntypedConstant {
         Constant::Record {
             location,
+            arguments_start_position,
             module,
             name,
             arguments,
@@ -1172,16 +1193,21 @@ pub trait UntypedConstantFolder {
         }
     }
 
-    fn fold_constant_string_concatenation(
+    fn fold_constant_binary_operator(
         &mut self,
         location: SrcSpan,
+        operator_start: u32,
+        operator: BinOp,
         left: Box<UntypedConstant>,
         right: Box<UntypedConstant>,
     ) -> UntypedConstant {
-        Constant::StringConcatenation {
+        Constant::BinaryOperator {
             location,
+            operator_start,
+            operator,
             left,
             right,
+            type_: (),
         }
     }
 
@@ -1229,6 +1255,7 @@ pub trait UntypedConstantFolder {
 
             Constant::Record {
                 location,
+                arguments_start_position,
                 module,
                 name,
                 arguments,
@@ -1247,6 +1274,7 @@ pub trait UntypedConstantFolder {
                 });
                 Constant::Record {
                     location,
+                    arguments_start_position,
                     module,
                     name,
                     arguments,
@@ -1301,24 +1329,30 @@ pub trait UntypedConstantFolder {
                 Constant::BitArray { location, segments }
             }
 
-            Constant::StringConcatenation {
+            Constant::BinaryOperator {
                 location,
+                operator_start,
                 left,
                 right,
+                operator,
+                type_: (),
             } => {
                 let left = Box::new(self.fold_constant(*left));
                 let right = Box::new(self.fold_constant(*right));
-                Constant::StringConcatenation {
+                Constant::BinaryOperator {
                     location,
+                    operator_start,
+                    operator,
                     left,
                     right,
+                    type_: (),
                 }
             }
         }
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub trait PatternFolder {
     /// You probably don't want to override this method.
     fn fold_pattern(&mut self, pattern: UntypedPattern) -> UntypedPattern {
@@ -1593,7 +1627,7 @@ pub trait PatternFolder {
         &mut self,
         location: SrcSpan,
         left_location: SrcSpan,
-        left_side_assignment: Option<(EcoString, SrcSpan)>,
+        left_side_assignment: Option<StringPrefixLeftSideAssignment>,
         right_location: SrcSpan,
         left_side_string: EcoString,
         right_side_assignment: AssignName,

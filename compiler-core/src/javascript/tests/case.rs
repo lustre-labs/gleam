@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2021 The Gleam contributors
+
 use crate::assert_js;
 
 #[test]
@@ -1058,6 +1061,26 @@ pub fn go() {
     )
 }
 
+// https://github.com/gleam-lang/gleam/issues/5748
+#[test]
+fn no_duplicate_let_when_rebinding_variable_after_directly_matching_case() {
+    assert_js!(
+        r#"
+pub fn go() {
+  let n = 1
+  case True {
+    True -> {
+      let n = 99
+      n
+    }
+    False -> 0
+  }
+  let n = n + 5
+  n
+}"#
+    )
+}
+
 #[test]
 fn semicolon_exists_with_directly_matching_case() {
     assert_js!(
@@ -1084,4 +1107,229 @@ pub fn go() {
   {2 + 4} * 2
 }"#
     )
+}
+
+// https://github.com/gleam-lang/gleam/issues/6029
+#[test]
+fn bit_array_slice_float_with_number_constructor() {
+    assert_js!(
+        "
+pub type Number {
+  Number(Int)
+}
+
+pub fn go(bit_array) {
+  case bit_array {
+    <<f:float>> -> f
+    _ -> 0.0
+  }
+}
+"
+    );
+}
+
+#[test]
+fn single_choice_switch_does_not_bind_subject() {
+    assert_js!(
+        "
+pub type Wibble {
+  Wibble(Int, Int)
+  Wobble
+}
+
+pub fn go(x) {
+  case x {
+    Wibble(1, 2) -> 1
+    _ -> 2
+  }
+}
+"
+    );
+}
+
+#[test]
+fn single_choice_switch_binds_subject_referenced_more_than_once() {
+    assert_js!(
+        "
+pub fn go(sequences) {
+  case sequences {
+    [] -> 0
+    [_] -> 1
+    [a, b, ..rest] -> a + b + go(rest)
+  }
+}
+"
+    );
+}
+
+#[test]
+fn single_choice_switch_binds_subject_referenced_by_guard() {
+    assert_js!(
+        "
+pub fn go(x) {
+  case x {
+    [a, b, ..rest] if b > 0 -> [a, b, ..rest]
+    _ -> []
+  }
+}
+"
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/6213
+#[test]
+fn shadowing_in_directly_matching_case_does_not_leak_out() {
+    assert_js!(
+        r#"
+pub fn go() {
+  let m = 1
+  let _ = case 0 + 0 {
+    _ -> {
+      let m = 99
+      m
+    }
+  }
+  m
+}"#
+    )
+}
+
+// https://github.com/gleam-lang/gleam/issues/6212
+#[test]
+fn pattern_shadowing_module_function_in_directly_matching_case() {
+    assert_js!(
+        r#"
+fn wibble(_: Int) -> Float {
+  0.0
+}
+
+pub fn go() {
+  case 0 + 0 {
+    wibble -> {
+      echo wibble
+    }
+  }
+  |> wibble
+}"#
+    )
+}
+
+#[test]
+fn guard_binding_in_directly_matching_case_is_not_redeclared() {
+    assert_js!(
+        r#"
+pub fn go(x) {
+  case x {
+    #(_, b) if b == 2 -> b
+    #(_, b) -> b
+  }
+  let b = 5
+  b
+}"#
+    )
+}
+
+// https://github.com/gleam-lang/gleam/issues/6182
+#[test]
+fn match_on_empty_bit_array_string() {
+    assert_js!(
+        "
+pub fn main(x) {
+  case x {
+    <<\"\":utf8>> -> \"a\"
+    _ -> \"b\"
+  }
+}
+"
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/6182
+#[test]
+fn match_on_empty_bit_array_string_in_middle() {
+    assert_js!(
+        "
+pub fn main(x) {
+  case x {
+    <<\"x\":utf8, \"\":utf8, \"z\":utf8, >> -> \"a\"
+    _ -> \"b\"
+  }
+}
+"
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/6182
+#[test]
+fn utf16_match_on_empty_bit_array_string() {
+    assert_js!(
+        "
+pub fn main(x) {
+  case x {
+    <<\"\":utf16>> -> \"a\"
+    _ -> \"b\"
+  }
+}
+"
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/6182
+#[test]
+fn utf16_match_on_empty_bit_array_string_in_middle() {
+    assert_js!(
+        r#"
+pub fn main(x) {
+  case x {
+    <<"x":utf16, "":utf16, "z":utf16, >> -> "a"
+    _ -> "b"
+  }
+}
+"#
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/6182
+#[test]
+fn utf32_match_on_empty_bit_array_string() {
+    assert_js!(
+        r#"
+pub fn main(x) {
+  case x {
+    <<"":utf32>> -> "a"
+    _ -> "b"
+  }
+}
+"#
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/6182
+#[test]
+fn utf32_match_on_empty_bit_array_string_in_middle() {
+    assert_js!(
+        r#"
+pub fn main(x) {
+  case x {
+    <<"x":utf32, "":utf32, "z":utf32, >> -> "a"
+    _ -> "b"
+  }
+}
+"#
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/6182
+#[test]
+fn empty_string_with_alias() {
+    assert_js!(
+        r#"
+pub fn main(x) {
+  case x {
+    <<"" as a:utf8>> -> a
+    _ -> "b"
+  }
+}
+"#
+    );
 }

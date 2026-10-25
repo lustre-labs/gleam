@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2024 The Gleam contributors
+
 use super::*;
 use lsp_types::{
     ActiveParameter, ParameterInformation, ParameterInformationLabel, SignatureHelp,
-    SignatureHelpParams, SignatureInformation,
+    SignatureHelpParams, SignatureInformation, WorkDoneProgressParams,
 };
 
 fn signature_help(tester: TestProject<'_>, position: Position) -> Option<SignatureHelp> {
@@ -9,7 +12,7 @@ fn signature_help(tester: TestProject<'_>, position: Position) -> Option<Signatu
         let params = SignatureHelpParams {
             context: None,
             text_document_position_params: param,
-            work_done_progress_params: Default::default(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let response = engine.signature_help(params);
 

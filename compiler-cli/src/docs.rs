@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2020 The Gleam contributors
+
 use std::{collections::HashMap, time::SystemTime};
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -7,7 +10,7 @@ use crate::{cli, fs::ProjectIO, http::HttpClient};
 use gleam_core::{
     Result,
     analyse::TargetSupport,
-    build::{Codegen, Compile, Mode, Options, Package, Target},
+    build::{Codegen, Compile, ErlangOutput, Mode, Options, Package, Target},
     config::{DocsPage, PackageConfig},
     docs::{Dependency, DependencyKind, DocContext},
     error::Error,
@@ -58,7 +61,7 @@ pub fn build(paths: &ProjectPaths, options: BuildOptions) -> Result<()> {
     // documentation for our package.
     crate::fs::delete_directory(&paths.build_directory_for_package(
         Mode::Prod,
-        options.target.unwrap_or(Target::Erlang),
+        options.target.unwrap_or(config.target),
         &config.name,
     ))?;
 
@@ -96,6 +99,7 @@ pub fn build(paths: &ProjectPaths, options: BuildOptions) -> Result<()> {
             warnings_as_errors: false,
             root_target_support: TargetSupport::Enforced,
             no_print_progress: false,
+            erlang_output: ErlangOutput::Binary,
         },
         manifest,
     )?;
@@ -147,14 +151,14 @@ pub(crate) fn build_documentation(
     dependencies: HashMap<EcoString, Dependency>,
     compiled: &mut Package,
     is_hex_publish: DocContext,
-    cached_modules: &im::HashMap<EcoString, type_::ModuleInterface>,
+    cached_modules: &imbl::HashMap<EcoString, type_::ModuleInterface>,
 ) -> Result<Vec<gleam_core::io::OutputFile>, Error> {
     compiled.attach_doc_and_module_comments();
     cli::print_generating_documentation();
     let mut pages = vec![DocsPage {
         title: "README".into(),
         path: "index.html".into(),
-        source: paths.readme(), // TODO: support non markdown READMEs. Or a default if there is none.
+        source: paths.readme(),
     }];
     pages.extend(config.documentation.pages.iter().cloned());
     let mut outputs = gleam_core::docs::generate_html(
@@ -168,7 +172,7 @@ pub(crate) fn build_documentation(
             context: is_hex_publish,
         },
         ProjectIO::new(),
-    );
+    )?;
 
     outputs.push(gleam_core::docs::generate_json_package_interface(
         Utf8PathBuf::from("package-interface.json"),
@@ -218,6 +222,7 @@ pub fn publish(paths: &ProjectPaths) -> Result<()> {
             mode: Mode::Prod,
             target: None,
             no_print_progress: false,
+            erlang_output: ErlangOutput::Binary,
         },
         manifest,
     )?;

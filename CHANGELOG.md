@@ -1,63 +1,27 @@
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  SPDX-FileCopyrightText: 2020 The Gleam contributors
+-->
+
 # Changelog
 
-## Unreleased
-
-### Compiler
-
- - The compiler now issues a friendlier error when attempting to pattern match
-   on both the prefix and suffix of a string:
-
-   ```
-   error: Syntax error
-     ┌─ /src/parse/error.gleam:2:23
-     │
-   2 │     "prefix" <> infix <> "suffix" -> infix
-     │                       ^^^^^^^^^^^ This pattern is not allowed
-
-   A string pattern can only match on a literal string prefix.
-
-   Matching on a literal suffix is not possible, because `infix` would have an
-   unknown size.
-   ```
-
-   ([Gavin Morrow](https://github.com/gavinmorrow))
-
-### Build tool
-
-- The build tool now generates Hexdocs URLs using the new format of
-  `package.hexdocs.pm` rather than `hexdocs.pm/package`.
-  ([Surya Rose](https://github.com/GearsDatapacks))
-
-### Language server
-
-### Formatter
+## v1.19.2 - 2026-10-12
 
 ### Bug fixes
 
-- When using the language server to extract a function from within an anonymous
-  function, the return value of the extracted function is respected.
+- Fixed a bug where the build tool would not reject invalid application names
+  if one is returned by the Hex API.
+  ([Louis Pilfold](https://github.com/lpil))
 
-  For example,
-  ```gleam
-  fn wibble() {
-    let wobble = fn() {
-      let random_number = 4
-      random_number * 42 // <- Extracting this line
-    }
-  }
-  ```
-  is turned into
-  ```gleam
-  fn wibble() {
-    let wobble = fn() {
-      let random_number = 4
-      function(random_number)
-    }
-  }
+- Fixed a bug where the compiler would generate invalid Erlang code for user
+  defined types, causing external tools like Dyalizer to crash.
+  ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
 
-  fn function(random_number: Int) -> Int {
-    random_number * 42
-  }
-  ```
+## v1.19.1 - 2026-10-07
 
-  [Gavin Morrow](https://github.com/gavinmorrow)
+### Bug fixes
+
+- Fixed a bug where the `export javascript-prelude` and
+  `export typescript-prelude` commands would not run.
+  ([Louis Pilfold](https://github.com/lpil))
+

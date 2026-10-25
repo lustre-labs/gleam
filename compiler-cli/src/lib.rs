@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2018 The Gleam contributors
+
 #![warn(
     clippy::all,
+    clippy::redundant_clone,
     clippy::dbg_macro,
     clippy::todo,
     clippy::mem_forget,
@@ -19,6 +23,8 @@
     clippy::option_option,
     clippy::verbose_file_reads,
     clippy::unnested_or_patterns,
+    clippy::default_trait_access,
+    clippy::format_push_string,
     rust_2018_idioms,
     missing_debug_implementations,
     missing_copy_implementations,
@@ -45,7 +51,8 @@
     clippy::match_single_binding,
     clippy::inconsistent_struct_constructor,
     clippy::assign_op_pattern,
-    clippy::len_without_is_empty
+    clippy::len_without_is_empty,
+    clippy::let_unit_value
 )]
 
 #[cfg(test)]
@@ -86,18 +93,21 @@ use clap::{
     Args, Parser, Subcommand,
     builder::{Styles, styling},
 };
+use ecow::EcoString;
 use gleam_core::{
     analyse::TargetSupport,
-    build::{Codegen, Compile, Mode, NullTelemetry, Options, Runtime, Target},
+    build::{Codegen, Compile, ErlangOutput, Mode, NullTelemetry, Options, Runtime, Target},
     hex::RetirementReason,
     paths::ProjectPaths,
     version::COMPILER_VERSION,
 };
+use std::collections::HashMap;
 
 #[derive(Args, Debug, Clone)]
 pub struct UpdateOptions {
-    /// (optional) Names of the packages to update
-    /// If omitted, all dependencies will be updated
+    /// (optional) Names of the packages to update.
+    ///
+    /// If omitted, all dependencies will be updated.
     #[arg(verbatim_doc_comment)]
     packages: Vec<String>,
 }
@@ -143,6 +153,12 @@ pub struct TreeOptions {
 )]
 pub enum Command {
     /// Build the project
+    ///
+    /// This command optionally accepts the environment variable
+    /// `HEXPM_READ_API_KEY`, which can hold a Hex API key to authenticate
+    /// with Hex with a higher rate limit.
+    ///
+    #[command(verbatim_doc_comment)]
     Build {
         /// Consider the build failed if the package contains any warnings
         #[arg(long)]
@@ -268,10 +284,20 @@ pub enum Command {
     /// and for applications made of multiple packages in a single version
     /// control repository.
     ///
+    /// This command optionally accepts the environment variable
+    /// `HEXPM_READ_API_KEY`, which can hold a Hex API key to authenticate
+    /// with Hex with a higher rate limit.
+    ///
     #[command(subcommand, verbatim_doc_comment)]
     Deps(Dependencies),
 
     /// Update dependency packages to their latest versions
+    ///
+    /// This command optionally accepts the environment variable
+    /// `HEXPM_READ_API_KEY`, which can hold a Hex API key to authenticate
+    /// with Hex with a higher rate limit.
+    ///
+    #[command(verbatim_doc_comment)]
     Update(UpdateOptions),
 
     /// Work with the Hex package manager
@@ -415,7 +441,7 @@ pub enum Command {
         packages: Vec<String>,
     },
 
-    /// Delete any build artifacts for this project
+    /// Delete any build artefacts for this project
     Clean,
 
     /// Run the language server, to be used by editors
@@ -626,8 +652,12 @@ impl Command {
                 let paths = find_project_paths(directory)?;
                 export::hex_tarball(&paths)
             }
-            Self::Export(ExportTarget::JavascriptPrelude) => export::javascript_prelude(),
-            Self::Export(ExportTarget::TypescriptPrelude) => export::typescript_prelude(),
+            Self::Export(ExportTarget::JavaScriptPrelude { output }) => {
+                export::javascript_prelude(output)
+            }
+            Self::Export(ExportTarget::TypeScriptPrelude { output }) => {
+                export::typescript_prelude(output)
+            }
             Self::Export(ExportTarget::PackageInterface { output }) => {
                 let paths = find_project_paths(directory)?;
                 export::package_interface(&paths, output)
@@ -666,20 +696,38 @@ pub enum ExportTarget {
     /// The package bundled into a tarball, suitable for publishing to Hex
     HexTarball,
     /// The JavaScript prelude module
-    JavascriptPrelude,
+    #[command(name = "javascript-prelude")]
+    JavaScriptPrelude {
+        /// (optional) The path to write the JavaScript file to.
+        ///
+        /// If ommited, the command will print to stdout.
+        #[arg(verbatim_doc_comment, long = "out")]
+        output: Option<Utf8PathBuf>,
+    },
     /// The TypeScript prelude module
-    TypescriptPrelude,
+    #[command(name = "typescript-prelude")]
+    TypeScriptPrelude {
+        /// (optional) The path to write the TypeScript file to.
+        ///
+        /// If ommited, the command will print to stdout.
+        #[arg(verbatim_doc_comment, long = "out")]
+        output: Option<Utf8PathBuf>,
+    },
     /// Information on the modules, functions, and types in the project in JSON format
     PackageInterface {
-        /// The path to write the JSON file to
-        #[arg(long = "out", required = true)]
-        output: Utf8PathBuf,
+        /// (optional) The path to write the JSON file to.
+        ///
+        /// If ommited, the command will print to stdout.
+        #[arg(verbatim_doc_comment, long = "out")]
+        output: Option<Utf8PathBuf>,
     },
     /// Package information (gleam.toml) in JSON format
     PackageInformation {
-        /// The path to write the JSON file to
-        #[arg(long = "out", required = true)]
-        output: Utf8PathBuf,
+        /// (optional) The path to write the JSON file to.
+        ///
+        /// If ommited, the command will print to stdout.
+        #[arg(verbatim_doc_comment, long = "out")]
+        output: Option<Utf8PathBuf>,
     },
 }
 
@@ -708,19 +756,19 @@ pub struct NewOptions {
 pub struct CompilePackage {
     /// The compilation target for the generated project
     #[arg(long, ignore_case = true, help = target_doc())]
-    target: Target,
+    pub target: Target,
 
     /// The directory of the Gleam package
     #[arg(long = "package")]
-    package_directory: Utf8PathBuf,
+    pub package_directory: Utf8PathBuf,
 
     /// A directory to write compiled package to
     #[arg(long = "out")]
-    output_directory: Utf8PathBuf,
+    pub output_directory: Utf8PathBuf,
 
-    /// A directories of precompiled Gleam projects
+    /// A directories of packages already compiled with the same version of Gleam
     #[arg(long = "lib")]
-    libraries_directory: Utf8PathBuf,
+    pub libraries_directory: Utf8PathBuf,
 
     /// The location of the JavaScript prelude module, relative to the `out`
     /// directory.
@@ -731,11 +779,78 @@ pub struct CompilePackage {
     /// importing of other JavaScript file extensions.
     ///
     #[arg(verbatim_doc_comment, long = "javascript-prelude")]
-    javascript_prelude: Option<Utf8PathBuf>,
+    pub javascript_prelude: Option<Utf8PathBuf>,
 
     /// Skip Erlang to BEAM bytecode compilation
     #[arg(long = "no-beam")]
-    skip_beam_compilation: bool,
+    pub skip_beam_compilation: bool,
+
+    /// Skip development code such as the `dev/` and `test/` directories, and the
+    /// `dev_dependencies` packages.
+    #[arg(long = "no-dev")]
+    pub no_dev: bool,
+
+    /// OTP application names for dependencies, in the form
+    /// `package=otp_app`, separated by commas.
+    ///
+    /// Required for any dependency whose OTP application name differs from
+    /// its package name. For example:
+    /// `--otp-app-names package1=some_app,package2=another_app`
+    #[arg(
+        default_value = "",
+        verbatim_doc_comment,
+        long = "otp-app-names",
+        value_parser = parse_otp_app_names
+    )]
+    pub otp_app_names: HashMap<EcoString, EcoString>,
+}
+
+fn parse_otp_app_names(input: &str) -> Result<HashMap<EcoString, EcoString>, String> {
+    input
+        .split(',')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((package, otp_app)) if !package.is_empty() && !otp_app.is_empty() => {
+                Ok((EcoString::from(package), EcoString::from(otp_app)))
+            }
+            _ => Err("expected the format `package=otp_app[,package=otp_app]`".into()),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+    use std::collections::HashMap;
+
+    #[test]
+    fn command_help_text() {
+        let mut command = super::Command::command().version("x.y.z");
+        let mut help = command.render_long_help();
+        for subcommand in command.get_subcommands_mut() {
+            help.push_str("\n\n=== Subcommand ");
+            help.push_str(subcommand.get_name());
+            help.push_str(" ===\n\n");
+            help.push_str(&subcommand.render_long_help().to_string().as_str());
+        }
+        insta::assert_snapshot!(help);
+    }
+
+    #[test]
+    fn parse_otp_app_names_test() {
+        assert_eq!(super::parse_otp_app_names("").unwrap(), HashMap::new());
+        assert_eq!(
+            super::parse_otp_app_names("one=two").unwrap(),
+            HashMap::from([("one".into(), "two".into())])
+        );
+        assert_eq!(
+            super::parse_otp_app_names("one=two,three=four").unwrap(),
+            HashMap::from([
+                ("one".into(), "two".into()),
+                ("three".into(), "four".into()),
+            ])
+        );
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -794,7 +909,9 @@ pub enum Hex {
         version: String,
     },
 
-    /// Revert a release from Hex
+    /// Revert a release, removing it from Hex.
+    ///
+    /// Releases can only be reverted within 24 hours since they were published.
     ///
     /// This command uses this environment variable:
     ///
@@ -829,6 +946,7 @@ pub enum Owner {
     ///
     #[command(verbatim_doc_comment)]
     Add {
+        #[arg(long)]
         package: String,
 
         /// The username or email of the additional owner
@@ -853,7 +971,7 @@ pub enum Owner {
         package: String,
 
         /// The username or email of the new owner
-        #[arg(long = "to")]
+        #[arg(long = "user")]
         username_or_email: String,
     },
 }
@@ -929,6 +1047,7 @@ fn command_check(paths: &ProjectPaths, target: Option<Target>) -> Result<()> {
             mode: Mode::Dev,
             target,
             no_print_progress: false,
+            erlang_output: ErlangOutput::Binary,
         },
         build::download_dependencies(paths, cli::Reporter::new())?,
     )?;
@@ -956,6 +1075,7 @@ fn command_build(
             mode: Mode::Dev,
             target,
             no_print_progress,
+            erlang_output: ErlangOutput::Binary,
         },
         manifest,
     )?;

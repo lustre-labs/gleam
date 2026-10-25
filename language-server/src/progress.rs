@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2023 The Gleam contributors
+
 use debug_ignore::DebugIgnore;
 use lsp_types::{
     InitializeParams, LspAny, ProgressParams, ProgressToken, WorkDoneProgressBegin,
@@ -47,7 +50,7 @@ impl<'a> ConnectionProgressReporter<'a> {
         self.connection
             .sender
             .send(lsp_server::Message::Notification(notification))
-            .expect("send_work_done_notification send")
+            .expect("send_work_done_notification send");
     }
 }
 

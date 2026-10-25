@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2024 The Gleam contributors
+
 use crate::{cli, http::HttpClient};
 use ecow::EcoString;
 use gleam_core::{
     Error, Result, encryption,
-    error::{FileIoAction, FileKind},
+    error::{FileIoAction, FileIoCause, FileKind},
     io::HttpClient as _,
     paths,
 };
@@ -13,6 +16,7 @@ pub const HEX_OAUTH_CLIENT_ID: &str = "877731e8-cb88-45e1-9b84-9214de7da421";
 
 pub const LOCAL_PASS_PROMPT: &str = "Local password";
 pub const API_ENV_NAME: &str = "HEXPM_API_KEY";
+pub const READONLY_API_ENV_NAME: &str = "HEXPM_READ_API_KEY";
 
 #[derive(Debug)]
 pub struct EncryptedLegacyApiKey {
@@ -116,8 +120,8 @@ impl<'runtime> HexAuthentication<'runtime> {
         let local_password = self.get_local_password()?;
         let encrypted_refresh_token =
             encryption::encrypt_with_passphrase(tokens.refresh_token.as_bytes(), &local_password)
-                .map_err(|e| Error::FailedToEncryptLocalHexApiKey {
-                detail: e.to_string(),
+                .map_err(|error| Error::FailedToEncryptLocalHexApiKey {
+                detail: error.to_string(),
             })?;
 
         let credentials = StoredOAuthCredentials {
@@ -156,9 +160,9 @@ It will be used to locally encrypt your Hex API tokens.
         loop {
             let password = cli::ask_password(LOCAL_PASS_PROMPT)?;
             if password.chars().count() < required_length {
-                println!("\nPlease use a password at least {required_length} characters long.\n")
+                println!("\nPlease use a password at least {required_length} characters long.\n");
             } else {
-                self.local_password = Some(password.clone());
+                self.local_password = Some(password);
                 return Ok(());
             }
         }
@@ -182,7 +186,7 @@ It will be used to locally encrypt your Hex API tokens.
     ///    an access token.
     /// 3. The OAuth flow.
     pub fn get_or_create_api_credentials(&mut self) -> Result<hexpm::Credentials> {
-        if let Some(key) = Self::read_env_api_key()? {
+        if let Some(key) = read_env_api_key() {
             return Ok(key);
         }
 
@@ -203,15 +207,6 @@ It will be used to locally encrypt your Hex API tokens.
         self.create_and_store_new_credentials_via_oauth()
     }
 
-    fn read_env_api_key() -> Result<Option<hexpm::Credentials>> {
-        let api_key = std::env::var(API_ENV_NAME).unwrap_or_default();
-        if api_key.trim().is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(hexpm::Credentials::ApiKey(EcoString::from(api_key))))
-        }
-    }
-
     /// Read, decrypt, and refresh OAuth keys stored on the filesystem.
     ///
     /// The new refresh is encrypted and stored on the file system for next use.
@@ -229,9 +224,7 @@ It will be used to locally encrypt your Hex API tokens.
             encrypted_credentials.refresh_token.as_bytes(),
             &local_password,
         )
-        .map_err(|e| Error::FailedToDecryptLocalHexApiKey {
-            detail: e.to_string(),
-        })?;
+        .map_err(|_| Error::FailedToDecryptLocalHexApiKey)?;
 
         // Use a refresh token, consuming it to get a new set of tokens.
         let request = hexpm::oauth_refresh_token_request(
@@ -257,11 +250,11 @@ It will be used to locally encrypt your Hex API tokens.
         }
         let toml = crate::fs::read(&path)?;
         let credentials: StoredOAuthCredentials =
-            toml::from_str(&toml).map_err(|e| Error::FileIo {
+            toml::from_str(&toml).map_err(|error| Error::FileIo {
                 action: FileIoAction::Parse,
                 kind: FileKind::File,
                 path,
-                err: Some(e.to_string()),
+                cause: FileIoCause::Other(error.to_string()),
             })?;
         Ok(Some(credentials.hexpm))
     }
@@ -365,4 +358,48 @@ struct StoredOAuthRepoCredentials {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct StoredOAuthCredentials {
     hexpm: StoredOAuthRepoCredentials,
+}
+
+/// Read a Hex API key from the `HEXPM_API_KEY` environment variable, if one is set.
+///
+/// This authenticates write commands such as `gleam publish`.
+fn read_env_api_key() -> Option<hexpm::Credentials> {
+    api_key_credentials(&std::env::var(API_ENV_NAME).unwrap_or_default())
+}
+
+/// Read a Hex API key from the `HEXPM_READ_API_KEY` environment variable, if one
+/// is set.
+///
+/// This is used to authenticate otherwise anonymous read requests (dependency
+/// resolution and package downloads) so that they are subject to Hex's higher
+/// per-user rate limits rather than the stricter per-IP limits.
+pub fn read_env_readonly_api_key() -> Option<hexpm::Credentials> {
+    api_key_credentials(&std::env::var(READONLY_API_ENV_NAME).unwrap_or_default())
+}
+
+fn api_key_credentials(api_key: &str) -> Option<hexpm::Credentials> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        None
+    } else {
+        Some(hexpm::Credentials::ApiKey(EcoString::from(api_key)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_credentials_trims_surrounding_whitespace() {
+        assert_eq!(
+            api_key_credentials("  secret\n"),
+            Some(hexpm::Credentials::ApiKey("secret".into())),
+        );
+    }
+
+    #[test]
+    fn api_key_credentials_blank_is_none() {
+        assert_eq!(api_key_credentials("  \n"), None);
+    }
 }
